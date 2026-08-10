@@ -86,6 +86,12 @@
     prompt nobody reads. Without this switch the run is unattended, which is what a scheduled task
     needs.
 
+    .PARAMETER MemberServerOu
+    Distinguished name of the OU the member server GPOs are linked to. Without it they are created
+    and fully populated but left unlinked, and the run says so. The domain controller GPOs always
+    link to the Domain Controllers container, which the tool reads from the directory rather than
+    assuming its name.
+
     .PARAMETER Force
     Proceed even when Scan found evidence that enforcing would break something, and skip the
     confirmation that an unattended -Apply otherwise asks for. Needed for a scheduled task that
@@ -173,12 +179,14 @@ param(
 
     [switch]$NoEventLog,
 
-    [switch]$Force
+    [switch]$Force,
+
+    [switch]$NoMenu
 )
 
 # Bumped whenever the baseline or a mechanism changes. Printed on every run and carried into the
 # report, so "which version produced this" is answerable from a pasted log rather than guessed at.
-$script:HardenKitVersion = '1.7.1'
+$script:HardenKitVersion = '1.8.0'
 
 $ErrorActionPreference = 'Stop'
 
@@ -1065,7 +1073,8 @@ function Get-HardenBaseline {
                 @{ Name = 'NoBackgroundPolicy'; Type = 'DWord'; Value = 0 }
                 @{ Name = 'NoGPOListChanges'; Type = 'DWord'; Value = 0 }
             )
-            Why = 'By default the security extension only runs when a GPO has changed. Someone who edits a value locally keeps it until the next policy edit, which may be never. This makes the settings reapply on every refresh, so local drift is corrected within the hour.'
+            Why = 'By default the security extension only runs when a GPO has changed - otherwise it waits out its own sixteen-hour cycle. Someone who edits a value locally therefore keeps it until the next policy edit, which may be never. With these two at zero the security settings reapply on every background refresh instead, which is every five minutes on a domain controller and every ninety on a member server. Measured in a lab: a hand-edited LDAPServerIntegrity was back at its policy value three minutes later, with no gpupdate and no restart.'
+            Observe = 'This is what turns the rest of the tool from a one-time deployment into something that holds. It also means a deliberate local exception will be undone - if a machine genuinely needs a different value, it needs its own GPO or an OU outside the link, not a registry edit.'
         })
 
     $s.Add([ordered]@{
@@ -2135,6 +2144,7 @@ function Invoke-HardenScan {
     param(
         [int]$Days = 30,
         [ValidateSet('Audit', 'Enforce')][string]$Level = 'Audit',
+        [ValidateSet('Baseline', 'Strict')][string]$HardeningProfile = 'Baseline',
         [string[]]$Area = @('Signing', 'LegacyAuth', 'CredentialProtection', 'Protocols', 'PolicyIntegrity', 'Logging', 'Services')
     )
 
@@ -2407,11 +2417,19 @@ function Invoke-HardenScan {
     else { 'Current state on the domain controllers' }
 
     Write-HardenLog -Message $header -Level Header
+    # Not filtered by profile, but marked: a Strict setting shown here without a word about it
+    # reads as something a default deployment would fix, and then does not. Same trap as -Area
+    # being ignored - the scan answering about more than the deployment would touch.
     $baseline = @(Get-HardenBaseline | Where-Object {
-            $_.Type -eq 'SecurityOption' -and $_.Target -in 'DC', 'Both' -and $_.Group -in $scoped
+            $_.Type -eq 'SecurityOption' -and $_.Target -in 'DC', 'Both' -and $_.Group -in $scoped -and
+            ($HardeningProfile -eq 'Strict' -or $_.Profile -eq 'Baseline' -or $_.Profile -eq 'Strict')
         })
+    $strictCount = @($baseline | Where-Object { $_.Profile -eq 'Strict' -and $HardeningProfile -ne 'Strict' }).Count
     if ($baseline.Count -eq 0) {
         Write-HardenLog -Message "No registry-backed settings in $($scoped -join ', ') - that group is delivered another way, so there is nothing to read here." -Level Info
+    }
+    elseif ($strictCount -gt 0) {
+        Write-HardenLog -Message "$strictCount of these belong to the Strict profile and are marked as such - deploying without -Profile Strict leaves them alone." -Level Info
     }
     $dc = $dcs | Select-Object -First 1
 
@@ -2453,8 +2471,9 @@ function Invoke-HardenScan {
                 }
                 else {
                     $shown = if ($null -eq $current) { 'not set' } else { $current }
-                    Write-HardenLog -Message "$($item.Name): $shown, target $target" -Level Info
-                    Add-HardenAction -Area 'Scan' -Setting $item.Id -Target $dc.HostName -Result 'Missing' -Detail "Currently $shown, target $target"
+                    $note = if ($item.Profile -eq 'Strict' -and $HardeningProfile -ne 'Strict') { ' [Strict profile - a default deployment will not touch this]' } else { '' }
+                    Write-HardenLog -Message "$($item.Name): $shown, target $target$note" -Level Info
+                    Add-HardenAction -Area 'Scan' -Setting $item.Id -Target $dc.HostName -Result 'Missing' -Detail "Currently $shown, target $target$note"
                 }
             }
             catch {
@@ -2698,8 +2717,31 @@ function Invoke-HardenDeployment {
 
             # ── link ─────────────────────────────────────────────────────────────────────────
             if (-not $targetDn) {
-                Write-HardenLog -Message "No member server OU given - link $gpoName yourself, or pass -MemberServerOu" -Level Warning
-                Add-HardenAction -Area $group -Setting "$gpoName link" -Target $role -Result 'Missing' -Detail 'No target OU supplied' -Severity 'Medium'
+                # Not knowing where to look is not the same as nothing being there. Reporting a
+                # link as missing because the caller omitted -MemberServerOu turns an operator
+                # omission into directory drift, and sends someone chasing a link that exists.
+                $existingLinks = @()
+                try {
+                    # Get-HardenAdParameter here rather than relying on an outer $ad: this block
+                    # sits in a different function than the one that defines it, and an empty
+                    # splat would silently query whichever DC happened to answer.
+                    $adParam = Get-HardenAdParameter
+                    $idPattern = "*$($creation.Gpo.Id.ToString())*"
+                    $existingLinks = @(
+                        @(Get-ADOrganizationalUnit -LDAPFilter '(gPLink=*)' -Properties gPLink @adParam -ErrorAction Stop)
+                        @(Get-ADObject -Identity $ctx.DomainDn -Properties gPLink @adParam -ErrorAction SilentlyContinue)
+                    ) | Where-Object { $_.gPLink -like $idPattern } | ForEach-Object { $_.DistinguishedName }
+                }
+                catch { }
+
+                if ($existingLinks.Count -gt 0) {
+                    Write-HardenLog -Message "$gpoName is linked to $($existingLinks -join ', ') - no -MemberServerOu given, so nothing was checked against it" -Level Skip
+                    Add-HardenAction -Area $group -Setting "$gpoName link" -Target $role -Result 'Compliant' -Detail "Linked to $($existingLinks -join ', ')"
+                }
+                else {
+                    Write-HardenLog -Message "$gpoName is not linked anywhere. Pass -MemberServerOu, or link it yourself." -Level Warning
+                    Add-HardenAction -Area $group -Setting "$gpoName link" -Target $role -Result 'Missing' -Detail 'GPO exists but is linked nowhere' -Severity 'Medium'
+                }
                 continue
             }
 
@@ -2723,7 +2765,10 @@ function Invoke-HardenDeployment {
     if ($needsReboot.Count -gt 0) {
         # In plan mode nothing was written, and a notice claiming otherwise erodes exactly the
         # trust the plan mode exists to build.
-        $rebootMsg = if ($WhatIfPreference) { 'After -Apply, these take effect only at the next reboot:' }
+        # Audit mode reads; plan mode plans; only a real apply writes. Saying "written" in the
+        # other two is the same mistake the plan-mode wording had.
+        $rebootMsg = if ($AuditOnly) { 'These would only take effect after a restart once deployed:' }
+        elseif ($WhatIfPreference) { 'After -Apply, these take effect only at the next reboot:' }
         else { 'Written, but not yet in force. These take effect at the next reboot:' }
         Write-HardenLog -Message $rebootMsg -Level Warning
         foreach ($r in ($needsReboot | Sort-Object { $_.Name })) {
@@ -3615,7 +3660,7 @@ switch ($Mode) {
         if ($Interactive) {
             Write-HardenLog -Message '-Interactive only applies to Deploy mode. Scan changes nothing, so there is nothing to confirm.' -Level Info
         }
-        $blockers = @(Invoke-HardenScan -Days $ScanDays -Level $Level -Area $Area)
+        $blockers = @(Invoke-HardenScan -Days $ScanDays -Level $Level -Area $Area -HardeningProfile $HardeningProfile)
         $summary = New-HardenSummary -Mode 'Scan' -Started $started -Context (Get-HardenContext) `
             -RunParameters $runParameters -Baseline (Get-HardenBaseline | Where-Object { $_.Group -in $Area }) `
             -AuditPolicy (Get-HardenAuditPolicy) -Blockers $blockers
