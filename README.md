@@ -8,8 +8,8 @@
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE?style=for-the-badge&logo=powershell&logoColor=white)](#prerequisites)
 [![Platform](https://img.shields.io/badge/Windows_Server-2016%2B-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#prerequisites)
-[![Lab tested](https://img.shields.io/badge/lab_tested-Server_2025-2ea44f?style=for-the-badge)](#what-has-been-tested)
-[![Settings](https://img.shields.io/badge/61_settings-29_topics-6f42c1?style=for-the-badge)](#what-it-deploys)
+![Lab tested](https://img.shields.io/badge/lab_tested-Server_2025-2ea44f?style=for-the-badge)
+[![Settings](https://img.shields.io/badge/80_settings-32_topics-6f42c1?style=for-the-badge)](#what-it-deploys)
 [![License](https://img.shields.io/badge/license-MIT-555555?style=for-the-badge)](LICENSE)
 
 <br>
@@ -19,7 +19,6 @@
 [**What it deploys**](#what-it-deploys) &nbsp;·&nbsp;
 [**Staged settings**](#the-nine-staged-settings) &nbsp;·&nbsp;
 [**Rollout**](#the-rollout) &nbsp;·&nbsp;
-[**Tested**](#what-has-been-tested) &nbsp;·&nbsp;
 [**Troubleshooting**](#troubleshooting)
 
 </div>
@@ -52,15 +51,13 @@ One PowerShell script. No module, no configuration file, no build step.
 <br>
 
 > [!WARNING]
-> **Lab-tested, not production-tested.** Every mode has been run end to end against a Windows
-> Server 2025 lab domain and each mechanism verified individually — see [what has been
-> tested](#what-has-been-tested). No production directory, no Pester suite, no second reviewer.
-> Take a system state backup of a domain controller before the first enforced deployment.
+> **Lab-tested, not production-tested.** Take a system state backup of a domain controller before
+> the first enforced deployment.
 
 > [!CAUTION]
-> **Two settings tattoo.** The LDAP interface diagnostic and the event log sizes live outside the
-> `Policies` registry branch, so unlinking the GPO does **not** remove them — see [rolling
-> back](#rolling-back). Everything else disappears when the link is removed.
+> **Unlinking is not a full revert.** Only the 22 settings delivered as policy registry values
+> disappear when the link goes. The 39 in the security template and the 18 written outside a
+> `Policies` branch stay where they are — see [rolling back](#rolling-back) for what to write back.
 
 > [!NOTE]
 > **Built with AI assistance.** Most of the code and documentation here was written by Claude
@@ -74,8 +71,12 @@ One PowerShell script. No module, no configuration file, no build step.
 ```powershell
 Unblock-File .\ADHardenKit.ps1
 
-# 1. See where you stand. Read-only.
+# No parameters on a console: an interactive menu walks through mode, profile,
+# level and scope, then prints the equivalent command line before running.
 .\ADHardenKit.ps1
+
+# 1. See where you stand. Read-only. (-NoMenu keeps this scriptable.)
+.\ADHardenKit.ps1 -NoMenu
 
 # 2. Turn on the observation. Nothing here can refuse an authentication.
 .\ADHardenKit.ps1 -Mode Deploy -Area Logging -Apply -MemberServerOu 'OU=Servers,DC=example,DC=com'
@@ -106,11 +107,11 @@ is what step 2 fixes.
 | --- | --- |
 | `-Apply` | Deploy mode only. Without it nothing is written, but the full plan is produced. |
 | `-Interactive` | Ask before each topic, showing its **current state** on the directory server next to what it would become, with an explanation and a Microsoft article number. |
-| `-Profile Baseline\|Strict` | `Baseline` (51 settings) carries little or no compatibility risk. `Strict` adds 10 that need a maintenance window. |
+| `-Profile Baseline\|Strict` | `Baseline` (60 settings) carries little or no compatibility risk. `Strict` adds 20 that need a maintenance window. |
 | `-Level Audit\|Enforce` | `Audit` deploys staged settings in their observing form. `Enforce` requires them. |
 | `-Area <groups>` | `Signing`, `LegacyAuth`, `CredentialProtection`, `Protocols`, `PolicyIntegrity`, `Logging`, `Services`. |
 | `-MemberServerOu <dn>` | Where to link the member server GPOs. Without it they are created but left unlinked, and the run says so. The DC GPOs link to `OU=Domain Controllers` automatically. |
-| `-Force` | Proceed even when the scan found evidence that enforcing would break something. |
+| `-Force` | Proceed even when the scan found evidence that enforcing would break something, and skip the confirmation an unattended `-Apply` otherwise asks for. |
 
 **Exit codes** &nbsp; `0` success &nbsp;·&nbsp; `1` failures &nbsp;·&nbsp; `2` drift found &nbsp;·&nbsp; `3` prerequisites failed &nbsp;·&nbsp; `4` enforcing would break something still in use
 
@@ -118,16 +119,16 @@ is what step 2 fixes.
 
 ## What it deploys
 
-**61 settings in 29 topics, plus 28 advanced audit subcategories.** Every group becomes its own GPO
+**80 settings in 32 topics, plus 28 advanced audit subcategories.** Every group becomes its own GPO
 per role — thirteen small ones rather than two large ones. Names follow `-GpoNamePattern`, so they
 can match your own convention.
 
 | Group | Domain controllers | Member servers | Settings |
 | --- | --- | --- | :-: |
 | **Signing** | `ADHardenKit-DC-Signing` | `ADHardenKit-Member-Signing` | 11 / 9 |
-| **LegacyAuth** | `ADHardenKit-DC-LegacyAuth` | `ADHardenKit-Member-LegacyAuth` | 11 / 10 |
-| **CredentialProtection** | `ADHardenKit-DC-CredentialProtection` | `ADHardenKit-Member-CredentialProtection` | 15 / 17 |
-| **Protocols** | `ADHardenKit-DC-Protocols` | `ADHardenKit-Member-Protocols` | 6 / 6 |
+| **LegacyAuth** | `ADHardenKit-DC-LegacyAuth` | `ADHardenKit-Member-LegacyAuth` | 12 / 10 |
+| **CredentialProtection** | `ADHardenKit-DC-CredentialProtection` | `ADHardenKit-Member-CredentialProtection` | 18 / 20 |
+| **Protocols** | `ADHardenKit-DC-Protocols` | `ADHardenKit-Member-Protocols` | 19 / 20 |
 | **PolicyIntegrity** | `ADHardenKit-DC-PolicyIntegrity` | `ADHardenKit-Member-PolicyIntegrity` | 2 / 2 |
 | **Logging** | `ADHardenKit-DC-Logging` | `ADHardenKit-Member-Logging` | 13 / 10 |
 | **Services** | `ADHardenKit-DC-Services` | — none, no setting applies | 1 / — |
@@ -135,9 +136,9 @@ can match your own convention.
 | Group | What it covers |
 | --- | --- |
 | **Signing** | LDAP server signing, channel binding, client integrity · SMB signing offered and required · Netlogon secure channel |
-| **LegacyAuth** | NTLMv2 only, no LM hash · NTLM session security · NTLM restriction both directions · Kerberos AES only · strong certificate binding · no plaintext or guest SMB |
-| **CredentialProtection** | LSA protection · Credential Guard with VBS and HVCI · WDigest, stored and cached credentials · four anonymous restrictions · machine account rotation · `LocalAccountTokenFilterPolicy` |
-| **Protocols** | LLMNR and NetBIOS off · SMBv1 driver **and** the Workstation dependency that goes with it · WinRM without basic, digest or plaintext |
+| **LegacyAuth** | NTLMv2 only, no LM hash · NTLM session security · NTLM restriction both directions · Kerberos AES only · strong certificate binding for Kerberos **and** Schannel · no plaintext or guest SMB |
+| **CredentialProtection** | LSA protection · Credential Guard with VBS and HVCI · **RDP with NLA, TLS and no outbound credential delegation** · WDigest, stored and cached credentials · four anonymous restrictions · machine account rotation · `LocalAccountTokenFilterPolicy` |
+| **Protocols** | **TLS 1.0/1.1, RC4 and Triple DES off in Schannel** · LLMNR, NetBIOS **and mDNS** off, NetBIOS also per interface via a GPO startup script · SMBv1 driver **and** the Workstation dependency that goes with it · WinRM without basic, digest or plaintext · **Point and Print restricted to administrators** |
 | **PolicyIntegrity** | UNC hardened paths for SYSVOL and NETLOGON (MS15-011) · forced reapplication, so local drift is corrected within the hour |
 | **Logging** | 28 audit subcategories · PowerShell logging · command line in event 4688 · NTLM auditing · LDAP interface diagnostics · log sizes · `SCENoApplyLegacyAuditPolicy` |
 | **Services** | Print Spooler disabled on domain controllers |
@@ -237,88 +238,40 @@ running with.
 
 ---
 
-## What has been tested
-
-<div align="center">
-
-**Server 2025 lab domain** &nbsp;·&nbsp; **4 GPOs deployed and linked** &nbsp;·&nbsp; **28/28 audit subcategories verified applied** &nbsp;·&nbsp; **0 failures**
-
-</div>
-
-Each mechanism was verified individually rather than inferred from a clean exit code: `GptTmpl.inf`
-read back from SYSVOL, CSE registration read from the GPO object, every deployed audit GUID
-compared against `auditpol /get /category:* /r`, `audit.csv` checked byte-level for a BOM,
-idempotency confirmed at `Created: 0`, and the interactive flow driven through `Y`, `N`, `A`, `S`
-and `Q` with scripted answers.
-
-### The bugs the lab found
-
-This list matters more than the successes, because it is the argument for testing rather than
-reading:
-
-| Bug | Effect if it had shipped |
-|---|---|
-| `@()` flattening the audit table | 25 rows became 125 loose strings — `audit.csv` would have been nonsense |
-| Audit CSE filed as a tool GUID | `auditcse.dll` never invoked; the entire advanced audit policy silently inert |
-| `AuditValue = 0` on SMB signing | The "safe" audit level would have **switched off** required SMB signing on a domain controller |
-| `$level` colliding with the `-Level` parameter | The NTLM scan crashed and reported 665 events with "no direction" |
-| `$script:Interactive` colliding with the `-Interactive` switch | The switch was silently overwritten; no prompts ever appeared |
-| Plan mode skipping the settings loop | `-Mode Deploy` without `-Apply` showed two GPO names and nothing else |
-
-Five of six needed a real directory or a real browser to surface. Two of them — the inert audit
-policy and the SMB downgrade — would have caused real harm in production.
-
-**Not tested:** production directory, multi-domain forest, Pester suite, second reviewer, code
-signing. `-Level Enforce` has never run against a populated directory, and the GPO version bump is
-only verified indirectly.
-
----
-
 ## Design decisions worth knowing
 
 **Security options are written into SYSVOL directly.** The `GroupPolicy` module cannot set Security
-Options, so the tool writes `GptTmpl.inf`, registers the security CSE in
-`gPCMachineExtensionNames` and bumps the GPO version. The file has to be **UTF-16** — `secedit`
-reads nothing else. The extension attribute is a list of bracketed groups where each group is one
-CSE GUID followed by all of its tool GUIDs: `[{CSE}{tool}{tool}]`, not `[{CSE}{tool}][{CSE}{tool}]`.
-Two groups with the same CSE GUID is malformed and breaks policy processing.
+Options, so the tool writes `GptTmpl.inf` (UTF-16 — `secedit` reads nothing else), registers the
+security CSE in `gPCMachineExtensionNames` and bumps the GPO version. The advanced audit policy is
+its own CSE with its own `audit.csv`, written without a BOM. Both details matter because getting
+either wrong produces a policy that sits in SYSVOL doing nothing, with no error anywhere.
 
-**The advanced audit policy is its own CSE.** `{F3CCC681-…}` is `auditcse.dll` itself, not a tool
-GUID under the security CSE. Getting that wrong — as this tool did until it was caught — means the
-whole audit policy sits in SYSVOL doing nothing, with no error anywhere. The file is also written
-**without a BOM**, because `Set-Content -Encoding UTF8` on PowerShell 5.1 writes one and it lands
-in front of the header the CSE parses.
-
-**The RC4 story changed under everyone's feet.** The Kerberos setting deploys `0x7FFFFFF8` rather
-than the commonly quoted `0x18` — both are AES-only today, but `0x18` drops the reserved future-type
-bits. More importantly this is only the member-side policy: since the January 2026 update the KDC
-side is governed by `DefaultDomainSupportedEncTypes`, defaulting to `0x18`, and
-`RC4DefaultDisablementPhase` stopped being read with the July 2026 updates.
+**The RC4 story is mostly decided by the platform now.** The Kerberos setting deploys `0x7FFFFFF8`
+rather than the commonly quoted `0x18` (same AES-only result, but keeps the reserved future-type
+bits). Since the January 2026 updates the KDC side is governed by `DefaultDomainSupportedEncTypes`,
+defaulting to `0x18`; the remaining work is finding the accounts that still need RC4, which the
+scan lists.
 
 **The scan says when it cannot see.** If the LDAP diagnostic is off, an empty result means an empty
-log, not a clean domain — and that is the most dangerous kind of green, because it invites someone
-to enforce on the strength of it. It also distinguishes *absent* from *wrong*: an unset
-`UseLogonCredential` means WDigest does not cache, which is compliant, not a gap. Seven settings
-carry their documented platform default for exactly this reason.
+log, not a clean domain — and it is reported as a finding, not a pass. It also distinguishes
+*absent* from *wrong*: settings whose platform default already matches the target are reported as
+compliant, not as gaps.
 
-**Deployment is additive.** The tool sets values; it never removes what was there before. Rollback
-is unlinking.
+**Deployment is additive, and so is most of it on the way out.** The tool sets values and never
+removes what was there before. Unlinking stops further enforcement, but only policy registry values
+are withdrawn — the security template's values and everything outside a `Policies` branch stay.
+Measured in a lab, not assumed.
 
 ---
 
 ## Reports
 
-Every run writes a timestamped log to `.\Logs` and a JSON + HTML report to `.\Reports`. The HTML is
-a single self-contained file with no external dependencies, so it survives being emailed, and it
-prints sensibly.
-
-It carries a colour-coded verdict, the full run context (domain, server, profile, level, scope, who
-ran it from where), the scan findings, an expandable card per topic with what it does and what it
-can break, a searchable table of every action, all 28 audit subcategories with reasons, and a
-context-dependent "what to do next".
-
-References are **numbers, not links** — KB, ADV and CVE identifiers. Links rot; a number can be
-pasted into any search box years from now.
+Every run writes a timestamped log to `.\Logs` and a JSON + HTML report to `.\Reports`. The HTML
+is one self-contained file — no external dependencies, so it survives being emailed and prints
+sensibly. It carries a colour-coded verdict, the full run context, an expandable card per topic
+with what it does and what it can break, a searchable table of every action, and a
+context-dependent "what to do next". References are KB/CVE **numbers, not links** — links rot, a
+number can be pasted into any search box years from now.
 
 ---
 
@@ -352,29 +305,61 @@ parameter — the link step is idempotent.
 ## Rolling back
 
 Unlink the GPO. That is the design: small GPOs grouped by purpose exist so one can be taken out
-without losing the rest.
+without losing the rest — and that part works, verified in a lab: disabling one link left the
+other groups untouched.
+
+**But most settings do not disappear when the link goes.** This was measured rather than assumed,
+and the result is less convenient than "unlink and you're done":
+
+| Delivered as | On unlink | Count |
+| --- | --- | :-: |
+| `registry.pol` under a `\Policies\` branch | **removed at the next refresh** | 22 |
+| `registry.pol` outside those branches | stays | 18 |
+| Security template (`GptTmpl.inf`) | **stays** | 39 |
+| Startup script | script stops running, value stays | 1 |
+
+The security template is the surprise: a template sets values and does not take them back when the
+policy stops applying. That is most of the baseline — every Security Option, including LSA
+protection, the anonymous restrictions and the Netlogon settings.
+
+So unlinking is the right first move when something breaks, because it stops any further
+enforcement and restores whatever the machine's own defaults reapply. It is not a full revert. For
+that, write the old values back:
 
 ```powershell
 Set-GPLink -Name 'ADHardenKit-DC-Signing' -Target 'OU=Domain Controllers,DC=example,DC=com' -LinkEnabled No
 gpupdate /force
-```
 
-**Two settings do not disappear**, because they live outside the `Policies` branch:
-
-```powershell
+# Diagnostics and log sizes
 Set-ItemProperty 'HKLM:\System\CurrentControlSet\Services\NTDS\Diagnostics' -Name '16 LDAP Interface Events' -Value 0
 Remove-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\WINEVT\Channels\Microsoft-Windows-PowerShell/Operational' -Name MaxSize
 Remove-ItemProperty 'HKLM:\System\CurrentControlSet\Services\EventLog\Directory Service' -Name MaxSize
+Remove-ItemProperty 'HKLM:\System\CurrentControlSet\Services\Dnscache\Parameters' -Name EnableMDNS
+
+# Schannel - removing the keys restores the platform default rather than the previous override
+Remove-Item 'HKLM:\System\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0' -Recurse
+Remove-Item 'HKLM:\System\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1' -Recurse
+Get-ChildItem 'HKLM:\System\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Ciphers' |
+    Where-Object PSChildName -match 'RC4|Triple DES' | Remove-Item -Recurse
+
+# LSA protection and the security template values
+Remove-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Lsa' -Name RunAsPPL
+Remove-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Lsa' -Name DisableRestrictedAdminOutboundCreds
+
+# NetBIOS per interface, if the startup script has already run
+Get-ChildItem 'HKLM:\System\CurrentControlSet\Services\NetBT\Parameters\Interfaces' |
+    ForEach-Object { Set-ItemProperty $_.PSPath -Name NetbiosOptions -Value 0 }
 ```
 
-Reboot-dependent settings have no undo other than setting them back and rebooting again. Test LSA
-protection on one server before the estate.
+Schannel and NetBIOS changes need a **reboot** to take effect in both directions, and LSA
+protection has no undo other than removing the value and restarting. Test it on one server before
+the estate.
 
 ---
 
 ## Limitations & notes
 
-- **Additive only.** Rollback is unlinking, not running the tool backwards.
+- **Additive only.** The tool sets values and never removes what was there before. Unlinking stops enforcement without reverting most of it — see [rolling back](#rolling-back).
 - **Single domain per run.** For a forest, run once per domain.
 - **The scan reads one domain controller** for the current-state section. Settings differing between controllers in a multi-site domain will not be caught.
 - **Member servers are only reached through Group Policy.** The tool never connects to them.
@@ -394,23 +379,10 @@ Logs/ · Reports/                 created on first run
 The script is organised into regions — `Core`, `Baseline`, `Interactive`, `Gpo`, `Scan`,
 `Deployment`, `Entry point` — in the order they execute.
 
-`Baseline` is the largest and contains almost no logic. That is deliberate: **the settings are
-data, not code.** Changing what this tool hardens means editing a table, and every entry carries its
-own explanation, blast radius, staged values, platform default and reference — which is also what
-the interactive prompts and the report are built from.
-
-```powershell
-$s.Add([ordered]@{
-    Id = 'LDAP-ServerSigning'; Topic = 'LDAP signing and channel binding'
-    Reference = 'KB4520412, ADV190023, CVE-2017-8563'; Group = 'Signing'
-    Name = 'LDAP server requires signing'
-    Type = 'SecurityOption'; Target = 'DC'; Profile = 'Baseline'; Staged = $true
-    Key = 'MACHINE\System\CurrentControlSet\Services\NTDS\Parameters\LDAPServerIntegrity'
-    ValueType = 4; AuditValue = 1; EnforceValue = 2
-    Why = 'An unsigned LDAP bind can be relayed. Requiring signing closes that, but any client that binds without signing stops working.'
-    Observe = 'Directory Service log, event 2889 names every client that bound without signing.'
-})
-```
+`Baseline` is the largest region and contains almost no logic. That is deliberate: **the settings
+are data, not code.** Every entry carries its own explanation, blast radius, staged values,
+platform default and reference — which is also what the interactive prompts and the report are
+built from. Changing what this tool hardens means editing a table.
 
 ## License
 
