@@ -1,4 +1,4 @@
-﻿<#
+<#
     .SYNOPSIS
     Hardens the protocol layer of an Active Directory domain: signing, credential exposure,
     legacy authentication and audit logging.
@@ -87,7 +87,23 @@
     needs.
 
     .PARAMETER Force
-    Proceed even when Scan found evidence that enforcing would break something.
+    Proceed even when Scan found evidence that enforcing would break something, and skip the
+    confirmation that an unattended -Apply otherwise asks for. Needed for a scheduled task that
+    runs on a console-less host only if that host reports itself as interactive; otherwise the
+    confirmation is skipped automatically.
+
+    .PARAMETER NoMenu
+    Started without any parameters on an interactive console, the script shows a menu instead of
+    running a scan. This switch suppresses the menu for the one case that is otherwise ambiguous:
+    a scheduled task or pipeline that deliberately runs the default scan with no other parameters.
+    Every invocation that passes any parameter at all already behaves as before.
+
+    .EXAMPLE
+    .\ADHardenKit.ps1
+
+    On a console with no parameters: the menu. Walks through what to do, which profile, level and
+    groups, whether to confirm each topic, and plan versus apply - then prints the equivalent
+    command line before running, so the menu doubles as a way of learning the parameters.
 
     .EXAMPLE
     .\ADHardenKit.ps1 -Mode Scan
@@ -159,6 +175,10 @@ param(
 
     [switch]$Force
 )
+
+# Bumped whenever the baseline or a mechanism changes. Printed on every run and carried into the
+# report, so "which version produced this" is answerable from a pasted log rather than guessed at.
+$script:HardenKitVersion = '1.7.1'
 
 $ErrorActionPreference = 'Stop'
 
@@ -680,6 +700,184 @@ function Get-HardenBaseline {
             Why = 'The default dependency list still names MRxSmb10. Disable that driver without removing it from here and the Workstation service fails to start on the next reboot, which takes the machine off the domain in every way that matters. Microsoft documents this pair together; they must never be deployed apart.'
         })
 
+    # ── Schannel: the channel everything else rides on ─────────────────────────────────────────
+    # LDAPS, RDP and WinRM all terminate in Schannel, so hardening the protocols above it while
+    # leaving TLS 1.0 enabled underneath is a gap rather than a layering choice.
+    #
+    # These keys sit outside the Policies branch and therefore TATTOO: unlinking the GPO leaves
+    # them behind and reverting means writing the old values back explicitly.
+
+    $s.Add([ordered]@{
+            Id = 'Schannel-Tls10-Server'; NeedsReboot = $true; Topic = 'TLS versions and cipher suites'; Group = 'Protocols'
+            Reference = 'KB245030, RFC 8996'; Name = 'TLS 1.0 server off'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Strict'; Staged = $false
+            RegKey = 'HKLM\System\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server'
+            Values = @(
+                @{ Name = 'Enabled'; Type = 'DWord'; Value = 0 }
+                @{ Name = 'DisabledByDefault'; Type = 'DWord'; Value = 1 }
+            )
+            Why = 'TLS 1.0 and 1.1 have no safe cipher suite left and are deprecated by RFC 8996, and RC4 and Triple DES are broken independently of the protocol carrying them. This matters more than it looks: LDAPS, RDP and WinRM all terminate in Schannel, so hardening those protocols while leaving TLS 1.0 enabled underneath secures the door and leaves the wall open. Server and client sides are separate keys because a machine can be strict about what it offers and still be talked down when it connects outward.'
+            Observe = 'Old appliances, scanners, printers and management agents are the usual casualties, and the failure looks like a network problem rather than a policy one. Check what still negotiates TLS 1.0 first - Schannel event 36880 in the System log records the protocol of every handshake once informational Schannel logging is on.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'Schannel-Tls10-Client'; NeedsReboot = $true; Topic = 'TLS versions and cipher suites'; Group = 'Protocols'
+            Name = 'TLS 1.0 client off'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Strict'; Staged = $false
+            RegKey = 'HKLM\System\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Client'
+            Values = @(
+                @{ Name = 'Enabled'; Type = 'DWord'; Value = 0 }
+                @{ Name = 'DisabledByDefault'; Type = 'DWord'; Value = 1 }
+            )
+            Why = 'The outgoing side. A server that will still speak TLS 1.0 to a remote endpoint can be downgraded into it.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'Schannel-Tls11-Server'; NeedsReboot = $true; Topic = 'TLS versions and cipher suites'; Group = 'Protocols'
+            Name = 'TLS 1.1 server off'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Strict'; Staged = $false
+            RegKey = 'HKLM\System\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server'
+            Values = @(
+                @{ Name = 'Enabled'; Type = 'DWord'; Value = 0 }
+                @{ Name = 'DisabledByDefault'; Type = 'DWord'; Value = 1 }
+            )
+            Why = 'Deprecated alongside TLS 1.0 and offering nothing TLS 1.2 does not.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'Schannel-Tls11-Client'; NeedsReboot = $true; Topic = 'TLS versions and cipher suites'; Group = 'Protocols'
+            Name = 'TLS 1.1 client off'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Strict'; Staged = $false
+            RegKey = 'HKLM\System\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Client'
+            Values = @(
+                @{ Name = 'Enabled'; Type = 'DWord'; Value = 0 }
+                @{ Name = 'DisabledByDefault'; Type = 'DWord'; Value = 1 }
+            )
+            Why = 'The outgoing side of the same.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'Schannel-Tls12-Server'; NeedsReboot = $true; Topic = 'TLS versions and cipher suites'; Group = 'Protocols'
+            Name = 'TLS 1.2 server on'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
+            RegKey = 'HKLM\System\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Server'
+            Values = @(
+                @{ Name = 'Enabled'; Type = 'DWord'; Value = 1 }
+                @{ Name = 'DisabledByDefault'; Type = 'DWord'; Value = 0 }
+            )
+            Why = 'Stated explicitly and deployed before the older versions are switched off, so a machine can never end up with every protocol disabled at once. On its own this changes nothing - TLS 1.2 is already on - which is exactly why it belongs in the Baseline profile while the removals sit in Strict.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'Schannel-Tls12-Client'; NeedsReboot = $true; Topic = 'TLS versions and cipher suites'; Group = 'Protocols'
+            Name = 'TLS 1.2 client on'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
+            RegKey = 'HKLM\System\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Client'
+            Values = @(
+                @{ Name = 'Enabled'; Type = 'DWord'; Value = 1 }
+                @{ Name = 'DisabledByDefault'; Type = 'DWord'; Value = 0 }
+            )
+            Why = 'The outgoing side.'
+        })
+
+    foreach ($rc4 in '40/128', '56/128', '64/128', '128/128') {
+        $s.Add([ordered]@{
+                Id = "Schannel-Rc4-$($rc4 -replace '/', '-')"; NeedsReboot = $true; Topic = 'TLS versions and cipher suites'; Group = 'Protocols'
+                Name = "RC4 $rc4 cipher off"
+                Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Strict'; Staged = $false
+                RegKey = "HKLM\System\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Ciphers\RC4 $rc4"
+                Values = @(@{ Name = 'Enabled'; Type = 'DWord'; Value = 0 })
+                Why = 'RC4 is broken as a stream cipher and there is no configuration that makes it safe. Four separate keys because Schannel treats each key length as its own cipher, and disabling only the shortest leaves the others available.'
+            })
+    }
+
+    $s.Add([ordered]@{
+            Id = 'Schannel-TripleDes'; NeedsReboot = $true; Topic = 'TLS versions and cipher suites'; Group = 'Protocols'
+            Reference = 'CVE-2016-2183'; Name = 'Triple DES cipher off'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Strict'; Staged = $false
+            RegKey = 'HKLM\System\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Ciphers\Triple DES 168'
+            Values = @(@{ Name = 'Enabled'; Type = 'DWord'; Value = 0 })
+            Why = 'A 64-bit block cipher, which is what makes the Sweet32 birthday attack practical on long-lived connections.'
+        })
+
+    # ── The Schannel half of the certificate binding story ─────────────────────────────────────
+    $s.Add([ordered]@{
+            Id = 'Schannel-CertificateMapping'; DefaultWhenUnset = 24
+            Topic = 'Certificate binding for Kerberos'; Group = 'LegacyAuth'
+            Reference = 'KB5014754, CVE-2022-26931, CVE-2022-26923'
+            Name = 'Strong certificate mapping for Schannel'
+            Type = 'SecurityOption'; Target = 'DC'; Profile = 'Baseline'; Staged = $false
+            Key = 'MACHINE\System\CurrentControlSet\Control\SecurityProviders\Schannel\CertificateMappingMethods'
+            ValueType = 4; EnforceValue = 24
+            Why = 'The companion to strong certificate binding on the KDC, which covers Kerberos only. This is the Schannel side, and 0x18 leaves just the two strong mapping methods - S4U2Self and its explicit form - with subject, issuer and UPN mapping switched off. Those three can be spoofed by anyone able to request a certificate with a chosen subject.'
+            Observe = 'Already the default since KB5014754, so this normally changes nothing. It is here because the value that gets set back to 0x1F to work around a certificate problem is the one nobody remembers to undo, and nothing in the directory reports it.'
+        })
+
+    # ── Remote Desktop ─────────────────────────────────────────────────────────────────────────
+    $s.Add([ordered]@{
+            Id = 'Rdp-SecureTransport'; Topic = 'Remote Desktop'; Group = 'CredentialProtection'
+            Name = 'RDP requires NLA, TLS and high encryption'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
+            RegKey = 'HKLM\Software\Policies\Microsoft\Windows NT\Terminal Services'
+            Values = @(
+                @{ Name = 'UserAuthentication'; Type = 'DWord'; Value = 1 }
+                @{ Name = 'SecurityLayer'; Type = 'DWord'; Value = 2 }
+                @{ Name = 'MinEncryptionLevel'; Type = 'DWord'; Value = 3 }
+                @{ Name = 'fEncryptRPCTraffic'; Type = 'DWord'; Value = 1 }
+                @{ Name = 'fPromptForPassword'; Type = 'DWord'; Value = 1 }
+            )
+            Why = 'Network Level Authentication makes the client authenticate before a session is created, which removes the pre-authentication attack surface and the resource exhaustion that goes with it. The security layer forces TLS rather than the legacy RDP protocol, and prompting for the password stops a saved credential being replayed into a server that turns out not to be the one expected.'
+            Observe = 'NLA needs CredSSP on the client. Anything connecting with a very old or non-Windows RDP client may stop working - most modern clients handle it.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'Rdp-NoOutboundCreds'; Topic = 'Remote Desktop'; Group = 'CredentialProtection'
+            Name = 'No credential delegation out of a Restricted Admin session'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
+            RegKey = 'HKLM\System\CurrentControlSet\Control\Lsa'
+            Values = @(@{ Name = 'DisableRestrictedAdminOutboundCreds'; Type = 'DWord'; Value = 1 })
+            Why = 'Stops a session that was established without sending credentials from handing them onward to the next hop anyway, which would defeat the point of connecting that way.'
+            Observe = 'This does not turn Restricted Admin on - deliberately. Restricted Admin protects the credentials of the person connecting, but it also makes a network logon with a stolen hash sufficient to reach the server, so switching it on is a trade rather than an improvement. Remote Credential Guard is the better answer where it is available; the setting below prepares the client side for it.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'Rdp-AllowProtectedCreds'; Topic = 'Remote Desktop'; Group = 'CredentialProtection'
+            Name = 'Remote Credential Guard permitted'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
+            RegKey = 'HKLM\Software\Policies\Microsoft\Windows\CredentialsDelegation'
+            Values = @(@{ Name = 'AllowProtectedCreds'; Type = 'DWord'; Value = 1 })
+            Why = 'Lets an administrator connect with Remote Credential Guard, where the Kerberos requests are sent back to the originating machine instead of the credentials being placed on the target. An administrative session on a server then leaves nothing behind that is worth stealing.'
+        })
+
+    # ── Point and Print ────────────────────────────────────────────────────────────────────────
+    # The spooler is disabled outright on domain controllers further down. On member servers it
+    # usually has to keep running, and this is what makes that survivable.
+    $s.Add([ordered]@{
+            Id = 'PointAndPrint-RestrictDrivers'; Topic = 'Point and Print'; Group = 'Protocols'
+            Reference = 'KB5005652, CVE-2021-34527'
+            Name = 'Only administrators may install printer drivers'
+            Type = 'AdminTemplate'; Target = 'Member'; Profile = 'Baseline'; Staged = $false
+            RegKey = 'HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint'
+            Values = @(
+                @{ Name = 'RestrictDriverInstallationToAdministrators'; Type = 'DWord'; Value = 1 }
+                @{ Name = 'NoWarningNoElevationOnInstall'; Type = 'DWord'; Value = 0 }
+                @{ Name = 'UpdatePromptSettings'; Type = 'DWord'; Value = 0 }
+            )
+            Why = 'This is the actual PrintNightmare mitigation, and the reason the vulnerability kept coming back: a printer driver runs as SYSTEM, and without this any user who can reach the spooler can install one. The two zeroes matter as much as the one - a warning that has been suppressed is how the restriction gets worked around.'
+            Observe = 'Users who currently install printers themselves will need a driver already present, deployed centrally, or an administrator. Plan the driver deployment before this, not after.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'Spooler-NoRemoteRpc'; Topic = 'Point and Print'; Group = 'Protocols'
+            Reference = 'CVE-2021-34527'
+            Name = 'Spooler does not accept remote print jobs'
+            Type = 'AdminTemplate'; Target = 'Member'; Profile = 'Strict'; Staged = $false
+            RegKey = 'HKLM\Software\Policies\Microsoft\Windows NT\Printers'
+            Values = @(@{ Name = 'RegisterSpoolerRemoteRpcEndPoint'; Type = 'DWord'; Value = 2 })
+            Why = 'A server that prints does not have to be a print server. Closing the remote RPC endpoint keeps local printing working while removing the interface that the printer bugs are reached through.'
+            Observe = 'Do not deploy this to an actual print server - it is exactly the function that machine exists to provide. Scope it with a separate OU or exclude the print servers from the link.'
+        })
+
     # ── Services ───────────────────────────────────────────────────────────────────────────────
     $s.Add([ordered]@{
             Id = 'Service-Spooler-DC'; Topic = 'Print spooler on domain controllers'; Group = 'Services'; Name = 'Print Spooler disabled on domain controllers'
@@ -877,6 +1075,37 @@ function Get-HardenBaseline {
             Values = @(@{ Name = 'EnableNetbios'; Type = 'DWord'; Value = 0 })
             Why = 'The other half of the name poisoning problem. Turning off LLMNR and leaving NBT-NS on just moves the attack one protocol along.'
             Observe = 'Anything genuinely relying on NetBIOS name resolution is old enough to be worth finding. Note that the policy that backs this value only exists on Windows 11 22H2 and Server 2025 and later - it appears in the Server 2025 baseline. Older servers ignore it silently, so they still need the per-adapter NetbiosOptions setting or DHCP option 001.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'mDNS-Disabled'; NeedsReboot = $true; Topic = 'Name resolution poisoning'; Group = 'Protocols'
+            Name = 'mDNS off'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
+            RegKey = 'HKLM\System\CurrentControlSet\Services\Dnscache\Parameters'
+            Values = @(@{ Name = 'EnableMDNS'; Type = 'DWord'; Value = 0 })
+            Why = 'The third of the three protocols Windows falls back to when DNS does not resolve a name, and the one that gets forgotten. Responder answers all three. Turning off LLMNR and NetBIOS while leaving mDNS listening on UDP 5353 moves the attack one protocol along rather than stopping it - which is the same reason NetBIOS is in this topic and not on its own.'
+            Observe = 'Read at service start only, so it needs a reboot. The value sits outside the Policies branch and therefore tattoos. Microsoft points at a Defender Firewall rule as the supported way to do this; the registry value is what actually stops the listener, and the two are complementary rather than alternatives. Only present on Windows Server 2019 and Windows 10 1703 and later - older builds have no mDNS to switch off. Wireless displays and network projectors are the things that notice.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'NetBIOS-PerInterface'; NeedsReboot = $true; Topic = 'Name resolution poisoning'; Group = 'Protocols'
+            Name = 'NetBIOS off on every interface'
+            Type = 'StartupScript'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
+            ScriptName = 'ADHardenKit-DisableNetbios.ps1'
+            ScriptBody = @'
+# Deployed by ADHardenKit. Sets NetbiosOptions to 2 (disabled) on every network interface.
+# A GPO cannot address these keys directly: each is named after a per-machine interface GUID.
+# Idempotent - it writes only what differs, and runs at every boot so a rebuilt machine is caught.
+$key = 'HKLM:\System\CurrentControlSet\Services\NetBT\Parameters\Interfaces'
+foreach ($iface in (Get-ChildItem -LiteralPath $key -ErrorAction SilentlyContinue)) {
+    $current = (Get-ItemProperty -LiteralPath $iface.PSPath -Name NetbiosOptions -ErrorAction SilentlyContinue).NetbiosOptions
+    if ($current -ne 2) {
+        Set-ItemProperty -LiteralPath $iface.PSPath -Name NetbiosOptions -Value 2 -Type DWord
+    }
+}
+'@
+            Why = 'The policy version of this setting only reaches interfaces that take their configuration from DHCP, which a server with a static address does not. On such a machine the policy is written, reports as applied, and NBT-NS keeps listening on UDP 137 anyway. This is the same setting one level down, delivered as a startup script because each interface key is named after a per-machine GUID and no policy can name a key it cannot know in advance.'
+            Observe = 'The only setting here delivered as a script rather than a value, and the only one that needs two restarts: the script runs after NetBT has already started, so it writes the value at one boot and the listener goes away at the next. Check for a second interface on a cluster or heartbeat network before assuming all of them should change, and remember that anything still resolving names over NetBIOS - old scanners, label printers, software using \\SERVERNAME without a DNS suffix - fails afterwards without an error that says NetBIOS. Removing the GPO link stops the script running but does not put the value back; that is a manual step with value 0.'
         })
 
     $s.Add([ordered]@{
@@ -1116,6 +1345,33 @@ function Get-HardenLiveValue {
             }
             return ($parts -join ', ')
         }
+        'StartupScript' {
+            # There is no single registry value to read, so report what the machine looks like
+            # today - the state the script would correct. Read from the directory server; a
+            # member server's own state is only visible once the script has run there.
+            $key = "$($ctx.Server)|netbt"
+            if ($script:LiveCache.ContainsKey($key)) { return $script:LiveCache[$key] }
+            $result = 'unknown'
+            try {
+                $vals = @(Invoke-Command -ComputerName $ctx.Server -ScriptBlock {
+                        foreach ($i in (Get-ChildItem -LiteralPath 'HKLM:\System\CurrentControlSet\Services\NetBT\Parameters\Interfaces' -ErrorAction SilentlyContinue)) {
+                            $v = (Get-ItemProperty -LiteralPath $i.PSPath -Name NetbiosOptions -ErrorAction SilentlyContinue).NetbiosOptions
+                            if ($null -eq $v) { 'not set' } else { "$v" }
+                        }
+                    } -ErrorAction Stop)
+                if ($vals.Count -eq 0) { $result = 'no interfaces' }
+                else {
+                    $distinct = @($vals | Sort-Object -Unique)
+                    $result = if ($distinct.Count -eq 1 -and $distinct[0] -eq '2') { 'startup script in the GPO' }
+                    elseif ($distinct.Count -eq 1) { "DC interfaces at $($distinct[0])" }
+                    else { "DC interfaces mixed: $($distinct -join '/')" }
+                }
+            }
+            catch { }
+            $script:LiveCache[$key] = $result
+            return $result
+        }
+
         'Service' {
             $key = "$($ctx.Server)|svc|$($Item.ServiceName)"
             if ($script:LiveCache.ContainsKey($key)) { return $script:LiveCache[$key] }
@@ -1154,7 +1410,12 @@ function Get-HardenTargetLabel {
         }
         'AdminTemplate' {
             if ($Item.Values.Count -eq 1) { return "$($Item.Values[0].Value)" }
-            return (($Item.Values | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', ')
+            $joined = ($Item.Values | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '
+            # Five registry values spelled out push the line off the right of the console and make
+            # the card harder to read than saying nothing. The names are in the report; here the
+            # count plus the explanation is what the decision needs.
+            if ($joined.Length -gt 42) { return "$($Item.Values.Count) values" }
+            return $joined
         }
         'Service' {
             # Startup modes as the security template writes them: 2 automatic, 3 manual, 4 disabled.
@@ -1165,6 +1426,9 @@ function Get-HardenTargetLabel {
                     default { "startup mode $($Item.StartupMode)" }
                 })
         }
+        # Value only, no name prefix: the row already carries the setting name, and the live
+        # reader has to produce a string that matches this one exactly for "already there" to work.
+        'StartupScript' { return 'startup script in the GPO' }
         'AuditCsv' { return "$($Item.EnforceValue) subcategories" }
         default { return "$($Item.EnforceValue)" }
     }
@@ -1236,6 +1500,10 @@ function Request-HardenTopicDecision {
     # space guarantees the separation whatever the value turns out to be.
     $currentWidth = [Math]::Max(12, (($rows | ForEach-Object { "$($_.Current)".Length }) | Measure-Object -Maximum).Maximum)
 
+    # Counted while rendering so the summary line below can say whether this topic does anything.
+    $alreadyCount = 0
+    $changeCount = 0
+
     foreach ($row in $rows) {
         $name = $row.Item.Name
         if ($name.Length -gt 40) { $name = $name.Substring(0, 39) + '~' }
@@ -1246,26 +1514,79 @@ function Request-HardenTopicDecision {
             Write-Host ("{0,-$currentWidth} " -f $row.Current) -ForegroundColor DarkGray -NoNewline
             Write-Host "not touched at Level $Level (Enforce: $($row.Item.EnforceValue))" -ForegroundColor DarkGray
         }
-        elseif ("$($row.Current)" -eq ("$($row.Target)" -replace ' \((observing|enforcing)\)$', '')) {
-            Write-Host ("{0,-$currentWidth} " -f $row.Current) -ForegroundColor Green -NoNewline
-            Write-Host "-> $($row.Target)  already there" -ForegroundColor DarkGray
+        elseif ($(
+                $targetPlain = "$($row.Target)" -replace ' \((observing|enforcing)\)$', ''
+                # (comparison below)
+                $same = "$($row.Current)" -eq $targetPlain
+                # A multi-string value like DependOnService compares by content, not order:
+                # "MRxSmb20 NSI Bowser" and "Bowser MRxSmb20 NSI" are the same dependency list,
+                # and showing that as a pending change makes the card cry wolf forever. Tokens are
+                # atomic name=value or single words, so set equality cannot confuse two different
+                # value assignments.
+                if (-not $same -and $row.Current -ne 'not set' -and $row.Current -ne 'unknown' -and $targetPlain -match '\s') {
+                    $a = @("$($row.Current)" -split '[,\s]+' | Where-Object { $_ }) | Sort-Object
+                    $b = @($targetPlain -split '[,\s]+' | Where-Object { $_ }) | Sort-Object
+                    $same = ($a.Count -eq $b.Count) -and (@(Compare-Object $a $b).Count -eq 0)
+                }
+                $same
+            )) {
+            # Deliberately dimmed, with only the verdict in colour. When three of four rows are
+            # already correct, painting them all green makes the one row that needs a decision
+            # look like just another line. The eye should land on the cyan.
+            $alreadyCount++
+            Write-Host ("{0,-$currentWidth} " -f $row.Current) -ForegroundColor DarkGray -NoNewline
+            Write-Host "-> $($row.Target)   " -ForegroundColor DarkGray -NoNewline
+            Write-Host 'already secure, no change' -ForegroundColor Green
         }
         else {
-            Write-Host ("{0,-$currentWidth} " -f $row.Current) -ForegroundColor Cyan -NoNewline
-            Write-Host "-> " -ForegroundColor DarkGray -NoNewline
+            $changeCount++
+            Write-Host ("{0,-$currentWidth} " -f $row.Current) -ForegroundColor White -NoNewline
+            Write-Host '-> ' -ForegroundColor DarkGray -NoNewline
             Write-Host $row.Target -ForegroundColor Cyan
         }
     }
 
-    # One intro, not one per value: prefer the explanation of the setting that carries the risk.
-    $lead = ($deployedItems | Where-Object { $_.Staged } | Select-Object -First 1)
-    if (-not $lead) { $lead = $deployedItems[0] }
+    $untouched = $rows.Count - $alreadyCount - $changeCount
+    if ($rows.Count -gt 1) {
+        Write-Host ''
+        Write-Host '       ' -NoNewline
+        if ($changeCount -eq 0) {
+            Write-Host "Nothing to do - all $($rows.Count) already at the target value." -ForegroundColor Green
+        }
+        else {
+            Write-Host "$changeCount of $($rows.Count) would change" -ForegroundColor Cyan -NoNewline
+            $rest = @(
+                if ($alreadyCount -gt 0) { "$alreadyCount already secure" }
+                if ($untouched -gt 0) { "$untouched not touched at this level" }
+            ) -join ', '
+            if ($rest) { Write-Host ", $rest." -ForegroundColor DarkGray } else { Write-Host '.' -ForegroundColor DarkGray }
+        }
+    }
+
+    # One intro, not one per value - and it has to be about the part that is actually going to
+    # change. On a machine where three of four settings are already correct, leading with the
+    # explanation of one of those three describes work that is not happening and buries the one
+    # thing the person is being asked to approve.
+    $changingItems = @($active | Where-Object {
+            "$($_.Current)" -ne ("$($_.Target)" -replace ' \((observing|enforcing)\)$', '')
+        } | ForEach-Object { $_.Item })
+    $preferred = if ($changingItems.Count -gt 0) { $changingItems } else { $deployedItems }
+
+    # Select-Object, never [0]: a baseline entry is an OrderedDictionary, and when a collection
+    # holds exactly one of them PowerShell unwraps it - so [0] stops meaning "the first item" and
+    # starts meaning "the first value inside that item", silently returning a string.
+    $lead = ($preferred | Where-Object { $_.Staged } | Select-Object -First 1)
+    if (-not $lead) { $lead = @($preferred) | Select-Object -First 1 }
     if ($lead.Why) {
         Write-Host ''
         foreach ($l in (Format-HardenWrapped -Text $lead.Why)) { Write-Host $l -ForegroundColor Gray }
     }
 
-    $observes = @($deployedItems | Where-Object { $_.Observe } | ForEach-Object { $_.Observe } | Sort-Object -Unique | Select-Object -First 2)
+    # Same ordering for the caveats, so a two-item cap never drops the caveat that matters.
+    $observes = @(
+        @($preferred | Where-Object { $_.Observe } | ForEach-Object { $_.Observe })
+        @($deployedItems | Where-Object { $_.Observe } | ForEach-Object { $_.Observe })
+    ) | Select-Object -Unique | Select-Object -First 2
     if ($observes.Count -gt 0) {
         Write-Host ''
         Write-Host '       Watch out' -ForegroundColor Yellow
@@ -1574,6 +1895,123 @@ function Add-HardenGpoExtension {
     }
 }
 
+function Set-HardenStartupScript {
+    <#
+        .SYNOPSIS
+        Puts a startup script into the GPO, for the few settings Group Policy cannot express as a
+        registry value.
+
+        .DESCRIPTION
+        Some settings live under a key whose name is a per-machine GUID. NetBIOS over TCP/IP is
+        the example: it is configured per network interface under
+        Services\NetBT\Parameters\Interfaces\Tcpip_{guid}, and no policy can name a key it cannot
+        know in advance.
+
+        The obvious workaround is to have the tool write to the machines directly. This does not,
+        deliberately - it stays a tool that only makes GPOs, because that is what gives every
+        other setting here its two best properties: it reaches whatever the OU contains without
+        an inventory, and it survives a rebuild. A machine reinstalled next year picks the script
+        up at its first boot with no one remembering to do anything.
+
+        Mechanically this is the same shape as the security template and the audit policy: write
+        the file into SYSVOL, register the client side extension, bump the version. Three details
+        that are easy to get wrong and silent when wrong:
+
+          - PowerShell scripts are listed in psscripts.ini, not scripts.ini, and that file must be
+            UTF-16. GPMC also marks it hidden; the client does not care but an administrator
+            comparing folders will.
+          - The CSE pair is {42B5FAAE-...}{40B6664F-...} for machine scripts. The 40B66650 variant
+            is the user half and registering that one instead means the script never runs.
+          - Entries are numbered. Appending a second script with index 0 replaces the first
+            rather than adding to it, so the existing file is read and the next free index used.
+
+        The timing is worth stating plainly: a startup script runs after the services it might
+        want to influence have already started. For NetBIOS that means the value is written at
+        one boot and takes effect at the next. Two restarts, not one.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][object]$Gpo,
+        [Parameter(Mandatory)][object]$Item,
+        [switch]$AuditOnly
+    )
+
+    # -GpoId, not -Gpo: PowerShell would bind -Gpo to -GpoId by prefix match and then fail to
+    # convert the GPO object into a Guid, with an error naming this function rather than the call.
+    $gpoPath = Get-HardenGpoPath -GpoId $Gpo.Id
+    $scriptDir = Join-Path $gpoPath 'Machine\Scripts\Startup'
+    $iniPath = Join-Path $gpoPath 'Machine\Scripts\psscripts.ini'
+    $scriptPath = Join-Path $scriptDir $Item.ScriptName
+
+    $existing = if (Test-Path -LiteralPath $scriptPath) { Get-Content -LiteralPath $scriptPath -Raw } else { $null }
+    $iniText = if (Test-Path -LiteralPath $iniPath) { Get-Content -LiteralPath $iniPath -Raw } else { '' }
+    $listed = $iniText -match [regex]::Escape($Item.ScriptName)
+
+    if ($existing -and $existing.Trim() -eq $Item.ScriptBody.Trim() -and $listed) {
+        Write-HardenLog -Message "Startup script $($Item.ScriptName): already in place" -Level Skip
+        Add-HardenAction -Area $Item.Group -Setting $Item.Id -Target $Gpo.DisplayName -Result 'Compliant'
+        return 'Compliant'
+    }
+
+    if ($AuditOnly) {
+        Write-HardenLog -Message "Startup script $($Item.ScriptName): missing" -Level Info
+        Add-HardenAction -Area $Item.Group -Setting $Item.Id -Target $Gpo.DisplayName -Result 'Missing'
+        return 'Missing'
+    }
+
+    if (-not $PSCmdlet.ShouldProcess($Gpo.DisplayName, "Write the startup script $($Item.ScriptName)")) {
+        Add-HardenAction -Area $Item.Group -Setting $Item.Id -Target $Gpo.DisplayName -Result 'Planned'
+        return 'Planned'
+    }
+
+    $result = if ($existing -or $listed) { 'Updated' } else { 'Created' }
+
+    New-Item -Path $scriptDir -ItemType Directory -Force -WhatIf:$false -Confirm:$false | Out-Null
+    # ASCII: the script is plain PowerShell and a BOM in front of the first line has caused
+    # enough grief elsewhere in this tool already.
+    Set-Content -LiteralPath $scriptPath -Value $Item.ScriptBody -Encoding ASCII -Force -WhatIf:$false -Confirm:$false
+
+    # Next free index under [Startup], so an existing script in the same GPO is not overwritten.
+    # Built by walking the lines rather than slicing them: $lines[1..0] on a one-element array is
+    # a descending range, which silently duplicates the section header instead of appending
+    # nothing.
+    $lines = if ($iniText) { @($iniText -split "`r?`n") } else { @() }
+    if (-not $listed) {
+        $used = @($lines | ForEach-Object { if ($_ -match '^\s*(\d+)CmdLine\s*=') { [int]$Matches[1] } })
+        $next = if ($used.Count -gt 0) { ($used | Measure-Object -Maximum).Maximum + 1 } else { 0 }
+        $entry = @("${next}CmdLine=$($Item.ScriptName)", "${next}Parameters=")
+
+        $out = [System.Collections.Generic.List[string]]::new()
+        $inserted = $false
+        foreach ($line in $lines) {
+            $out.Add($line)
+            if (-not $inserted -and $line.Trim() -eq '[Startup]') {
+                foreach ($x in $entry) { $out.Add($x) }
+                $inserted = $true
+            }
+        }
+        if (-not $inserted) {
+            $out.Insert(0, '[Startup]')
+            for ($i = 0; $i -lt $entry.Count; $i++) { $out.Insert($i + 1, $entry[$i]) }
+        }
+        $lines = $out.ToArray()
+    }
+
+    # Trailing blank lines accumulate on every rewrite otherwise.
+    $text = (($lines | Where-Object { $null -ne $_ }) -join "`r`n").TrimEnd("`r", "`n")
+
+    # UTF-16, which is what the scripts CSE reads - the same requirement as GptTmpl.inf.
+    Set-Content -LiteralPath $iniPath -Value $text -Encoding Unicode -Force -WhatIf:$false -Confirm:$false
+    try { (Get-Item -LiteralPath $iniPath -Force).Attributes = 'Hidden' } catch { }
+
+    Add-HardenGpoExtension -Gpo $Gpo -CseGuid '{42B5FAAE-6536-11D2-AE5A-0000F87571E3}' -ToolGuid '{40B6664F-4972-11D1-A7CA-0000F87571E3}'
+    Update-HardenGpoVersion -Gpo $Gpo
+
+    Write-HardenLog -Message "Startup script $($Item.ScriptName): $result" -Level Success
+    Add-HardenAction -Area $Item.Group -Setting $Item.Id -Target $Gpo.DisplayName -Result $result -Detail $Item.ScriptName
+    return $result
+}
+
 function Update-HardenGpoVersion {
     <#
         .SYNOPSIS
@@ -1696,7 +2134,8 @@ function Invoke-HardenScan {
     [CmdletBinding()]
     param(
         [int]$Days = 30,
-        [ValidateSet('Audit', 'Enforce')][string]$Level = 'Audit'
+        [ValidateSet('Audit', 'Enforce')][string]$Level = 'Audit',
+        [string[]]$Area = @('Signing', 'LegacyAuth', 'CredentialProtection', 'Protocols', 'PolicyIntegrity', 'Logging', 'Services')
     )
 
     $ctx = Get-HardenContext
@@ -1781,7 +2220,7 @@ function Invoke-HardenScan {
     # ── NTLM usage ────────────────────────────────────────────────────────────────────────────
     Write-HardenLog -Message 'NTLM authentication' -Level Header
     $ntlmTotal = 0
-    $ntlmByEvent = @{ 8001 = 0; 8002 = 0; 8003 = 0; 8004 = 0 }
+    $ntlmByEvent = @{}
     foreach ($dc in $dcs) {
         try {
             $events = @()
@@ -1800,19 +2239,34 @@ function Invoke-HardenScan {
             Write-HardenLog -Message "$($dc.HostName): $($events.Count) NTLM event(s)" -Level $logLevel
 
             if ($events.Count -gt 0) {
-                # A bare count says nothing about what would break. 8001 is outgoing NTLM from
-                # this machine, 8002 is a process on it, 8004 is an inbound authentication that
-                # a domain-wide block would refuse. They are not interchangeable and only 8004
-                # says anything about the DC's own exposure.
+                # A bare count says nothing about what would break, and the directions are easy
+                # to get backwards - this classification follows the Microsoft assessment guide:
+                # 8001 is written on the machine that went OUT with NTLM, 8002 on the machine
+                # that RECEIVED it, 8003/8004 are the domain-wide audit as seen by a member and
+                # the DC respectively. The 40xx series is the Server 2025 / Win11 24H2 enhanced
+                # auditing (KB5064479) - richer detail, same story.
                 foreach ($g in ($events | Group-Object Id | Sort-Object Count -Descending)) {
-                    $meaning = switch ([int]$g.Name) {
-                        8001 { 'outgoing NTLM to a remote server' }
-                        8002 { 'a local process using NTLM' }
-                        8003 { 'inbound NTLM that was blocked' }
-                        8004 { 'inbound NTLM this domain accepted' }
-                        default { 'other NTLM activity' }
+                    $id = [int]$g.Name
+                    $meaning = switch ($id) {
+                        8001 { 'outgoing NTLM from this machine' }
+                        8002 { 'incoming NTLM to this machine' }
+                        8003 { 'NTLM in this domain, member server view' }
+                        8004 { 'NTLM in this domain, seen by the DC - names user and workstation' }
+                        4001 { 'outgoing NTLM that was blocked' }
+                        4002 { 'incoming NTLM that was blocked' }
+                        4003 { 'domain NTLM that was blocked, member view' }
+                        4004 { 'domain NTLM that was blocked, DC view' }
+                        4014 { 'per-authentication NTLM detail (Server 2025 enhanced auditing) - includes why NTLM was chosen' }
+                        4024 { 'NTLMv1-derived credentials used - remediate before October 2026 enforcement' }
+                        4025 { 'NTLMv1-derived credentials blocked' }
+                        default {
+                            if ($id -in 4020..4023) { 'enhanced NTLM audit, client and server side (KB5064479)' }
+                            elseif ($id -in 4030..4033) { 'enhanced NTLM audit on the DC (KB5064479) - 4032 names the NTLM version' }
+                            else { 'other NTLM activity' }
+                        }
                     }
-                    $ntlmByEvent[[int]$g.Name] = $ntlmByEvent[[int]$g.Name] + $g.Count
+                    if (-not $ntlmByEvent.ContainsKey($id)) { $ntlmByEvent[$id] = 0 }
+                    $ntlmByEvent[$id] = $ntlmByEvent[$id] + $g.Count
                     Write-HardenLog -Message "    $($g.Count)x  event $($g.Name) - $meaning" -Level Info
                 }
 
@@ -1845,17 +2299,34 @@ function Invoke-HardenScan {
     }
     else {
         # This is the whole point of the scan: NTLM in the log means the restricting settings
-        # have something to refuse. Which one is at risk depends on the direction.
-        $inbound = $ntlmByEvent[8004] + $ntlmByEvent[8003]
-        $outbound = $ntlmByEvent[8001] + $ntlmByEvent[8002]
-        if ($inbound -gt 0) {
-            $blockers.Add("NTLM inbound: $inbound authentication(s) recorded. Setting Deny incoming NTLM to 2 refuses every one of them.")
-        }
+        # have something to refuse. Which one is at risk depends on the direction, and each
+        # direction maps to exactly one policy.
+        $get = { param($k) if ($ntlmByEvent.ContainsKey($k)) { $ntlmByEvent[$k] } else { 0 } }
+        $outbound = (& $get 8001) + (& $get 4001)
+        $inbound = (& $get 8002) + (& $get 4002)
+        $domain = (& $get 8003) + (& $get 8004) + (& $get 4003) + (& $get 4004)
+        $detail = (& $get 4014)
+        $v1 = (& $get 4024) + (& $get 4025)
+
         if ($outbound -gt 0) {
-            $blockers.Add("NTLM outbound: $outbound authentication(s) recorded. Setting Deny outgoing NTLM to 2 refuses every one of them.")
+            $blockers.Add("NTLM outbound: $outbound authentication(s) left this machine. Deny outgoing NTLM at 2 refuses every one - the 8001 events name the target servers.")
         }
-        if ($inbound -eq 0 -and $outbound -eq 0) {
-            $blockers.Add("NTLM: $ntlmTotal event(s) recorded that carry no direction this tool recognises. Read the NTLM operational log before restricting anything.")
+        if ($inbound -gt 0) {
+            $blockers.Add("NTLM inbound: $inbound authentication(s) reached this machine. Deny incoming NTLM at 2 refuses every one - the 8002 events name the calling process.")
+        }
+        if ($domain -gt 0) {
+            $blockers.Add("NTLM in the domain: $domain authentication(s) observed by the domain audit. The 8004 events on the DC name user, workstation and target - this list is the migration worklist.")
+        }
+        if ($v1 -gt 0) {
+            $blockers.Add("NTLMv1-derived credentials: $v1 event(s). These stop working with the October 2026 enforcement regardless of anything this tool does - remediate first.")
+        }
+        if ($outbound -eq 0 -and $inbound -eq 0 -and $domain -eq 0 -and $v1 -eq 0) {
+            if ($detail -gt 0) {
+                Write-HardenLog -Message "NTLM detail events only (4014): usage records with the reason NTLM was chosen - missing SPNs and IP-address access are the usual ones. Worth reading, but nothing here blocks enforcement by itself." -Level Info
+            }
+            else {
+                $blockers.Add("NTLM: $ntlmTotal event(s) recorded that carry no direction this tool recognises. Read the NTLM operational log before restricting anything.")
+            }
         }
     }
 
@@ -1925,8 +2396,23 @@ function Invoke-HardenScan {
     }
 
     # ── what is set today ─────────────────────────────────────────────────────────────────────
-    Write-HardenLog -Message 'Current state on the domain controllers' -Level Header
-    $baseline = @(Get-HardenBaseline | Where-Object { $_.Type -eq 'SecurityOption' -and $_.Target -in 'DC', 'Both' })
+    # Scoped, because being asked about one group and answered about all seven is how a report
+    # gets skimmed. The event log sections above stay unscoped on purpose - they describe the
+    # domain, not a group, and their findings are what gate any later enforcement.
+    $allGroups = 'Signing', 'LegacyAuth', 'CredentialProtection', 'Protocols', 'PolicyIntegrity', 'Logging', 'Services'
+    $scoped = @($Area | Where-Object { $_ -in $allGroups })
+    $header = if ($scoped.Count -lt $allGroups.Count) {
+        "Current state on the domain controllers - $($scoped -join ', ')"
+    }
+    else { 'Current state on the domain controllers' }
+
+    Write-HardenLog -Message $header -Level Header
+    $baseline = @(Get-HardenBaseline | Where-Object {
+            $_.Type -eq 'SecurityOption' -and $_.Target -in 'DC', 'Both' -and $_.Group -in $scoped
+        })
+    if ($baseline.Count -eq 0) {
+        Write-HardenLog -Message "No registry-backed settings in $($scoped -join ', ') - that group is delivered another way, so there is nothing to read here." -Level Info
+    }
     $dc = $dcs | Select-Object -First 1
 
     if ($dc) {
@@ -2140,6 +2626,17 @@ function Invoke-HardenDeployment {
                         }
                     }
 
+                    'StartupScript' {
+                        # Goes into this role's own GPO like everything else, so the member GPO
+                        # carries it too and the OU decides who runs it.
+                        if (Test-HardenTopicApproved -Item $item) {
+                            [void](Set-HardenStartupScript -Gpo $creation.Gpo -Item $item -AuditOnly:$AuditOnly)
+                        }
+                        else {
+                            Add-HardenAction -Area $group -Setting $item.Id -Target $role -Result 'Skipped' -Detail 'Declined'
+                        }
+                    }
+
                     'Service' {
                         if (Test-HardenTopicApproved -Item $item) {
                             $services[$item.ServiceName] = $item.StartupMode
@@ -2224,7 +2721,11 @@ function Invoke-HardenDeployment {
     # first time someone adds a setting and does not think to update it.
     $needsReboot = @($baseline | Where-Object { $_.NeedsReboot -and $_.Group -in $Area })
     if ($needsReboot.Count -gt 0) {
-        Write-HardenLog -Message 'Written, but not yet in force. These take effect at the next reboot:' -Level Warning
+        # In plan mode nothing was written, and a notice claiming otherwise erodes exactly the
+        # trust the plan mode exists to build.
+        $rebootMsg = if ($WhatIfPreference) { 'After -Apply, these take effect only at the next reboot:' }
+        else { 'Written, but not yet in force. These take effect at the next reboot:' }
+        Write-HardenLog -Message $rebootMsg -Level Warning
         foreach ($r in ($needsReboot | Sort-Object { $_.Name })) {
             Write-HardenLog -Message "    $($r.Name)" -Level Info
         }
@@ -2338,6 +2839,7 @@ function New-HardenReport {
     # ── run facts ─────────────────────────────────────────────────────────────────────────────
     $p = $Summary.Parameters
     $facts = [ordered]@{
+        'ADHardenKit'      = $(if ($p -and $p['Version']) { $p['Version'] } else { 'unknown' })
         'Domain'           = $Summary.Domain
         'Directory server' = $Summary.Server
         'Mode'             = $mode
@@ -2390,7 +2892,9 @@ function New-HardenReport {
             $refs = @($tg.Group | Where-Object { $_.Reference } | ForEach-Object { $_.Reference -split ',\s*' } | Sort-Object -Unique)
             $settingList = ($tg.Group | ForEach-Object { '<li>{0}</li>' -f (& $e $_.Name) }) -join ''
             $lead = ($tg.Group | Where-Object { $_.Staged } | Select-Object -First 1)
-            if (-not $lead) { $lead = $tg.Group[0] }
+            # Same OrderedDictionary unwrapping trap as in the interactive card: with exactly one
+            # entry in the group, [0] returns that entry's first value rather than the entry.
+            if (-not $lead) { $lead = @($tg.Group) | Select-Object -First 1 }
 
             @"
 <details class="topic s-$state">
@@ -2733,15 +3237,316 @@ function New-HardenSummary {
 #endregion Deployment
 
 ####################################################################################################
+#region Menu
+####################################################################################################
+
+function Read-HardenMenuChoice {
+    <#
+        .SYNOPSIS
+        Prints numbered options and returns the chosen key. Enter picks the default.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Question,
+        [Parameter(Mandatory)][object[]]$Options,   # @{ Key; Label; Detail } each
+        [string]$Default
+    )
+
+    Write-Host ''
+    Write-Host "  $Question" -ForegroundColor White
+    foreach ($opt in $Options) {
+        $marker = if ($opt.Key -eq $Default) { ' (default)' } else { '' }
+        Write-Host '    [' -ForegroundColor DarkGray -NoNewline
+        Write-Host $opt.Key -ForegroundColor Cyan -NoNewline
+        Write-Host ']' -ForegroundColor DarkGray -NoNewline
+        Write-Host (" {0}{1}" -f $opt.Label, $marker) -ForegroundColor Gray
+        if ($opt.Detail) { Write-Host ("        {0}" -f $opt.Detail) -ForegroundColor DarkGray }
+    }
+
+    while ($true) {
+        $answer = (Read-Host '  Choice').Trim()
+        if ([string]::IsNullOrEmpty($answer) -and $Default) { return $Default }
+        $hit = $Options | Where-Object { "$($_.Key)" -eq $answer -or "$($_.Key)".ToUpper() -eq $answer.ToUpper() } | Select-Object -First 1
+        if ($hit) { return $hit.Key }
+        Write-Host '  Not one of the options.' -ForegroundColor Red
+    }
+}
+
+function Confirm-HardenApply {
+    <#
+        .SYNOPSIS
+        One last look before an unattended -Apply writes anything.
+
+        .DESCRIPTION
+        With -Interactive every topic is confirmed individually, so this would be the seventeenth
+        prompt and adds nothing. Without it, -Apply goes from command line straight to writing,
+        and the difference between a plan and a deployment is four characters that are easy to
+        leave on from the previous command. This is the brake.
+
+        Skipped entirely when the session has no console, so a scheduled task is unaffected, and
+        with -Force for a deliberate unattended run. The default answer is no: someone who meant
+        to deploy can type one letter, and someone who did not gets to keep their afternoon.
+
+        Nothing here talks to the directory - it describes what the run intends from the baseline
+        and the parameters, which is exactly what the person needs to recognise a wrong command.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$HardeningProfile,
+        [Parameter(Mandatory)][string]$Level,
+        [Parameter(Mandatory)][string[]]$Area,
+        [Parameter(Mandatory)][string]$GpoNamePattern,
+        [string]$MemberOu
+    )
+
+    $baseline = @(Get-HardenBaseline)
+    if ($HardeningProfile -eq 'Baseline') { $baseline = @($baseline | Where-Object { $_.Profile -eq 'Baseline' }) }
+    $inScope = @($baseline | Where-Object { $_.Group -in $Area })
+
+    $gpos = [System.Collections.Generic.List[string]]::new()
+    foreach ($group in $Area) {
+        foreach ($role in 'DC', 'Member') {
+            $count = @($inScope | Where-Object { $_.Group -eq $group -and ($_.Target -eq $role -or $_.Target -eq 'Both') }).Count
+            if ($count -eq 0 -and -not ($group -eq 'Logging')) { continue }
+            $gpos.Add(($GpoNamePattern -replace '\{ROLE\}', $role -replace '\{GROUP\}', $group))
+        }
+    }
+
+    $staged = @($inScope | Where-Object { $_.Staged })
+    $reboot = @($inScope | Where-Object { $_.NeedsReboot })
+    $scripts = @($inScope | Where-Object { $_.Type -eq 'StartupScript' })
+
+    Write-Host ''
+    Write-Host '  ' -NoNewline
+    Write-Host ' APPLY ' -ForegroundColor Black -BackgroundColor Yellow -NoNewline
+    Write-Host '  This run writes to Group Policy.' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host ("    Profile   {0}" -f $HardeningProfile) -ForegroundColor Gray
+    Write-Host '    Level     ' -ForegroundColor Gray -NoNewline
+    if ($Level -eq 'Enforce') {
+        Write-Host 'Enforce - staged settings will require, not observe' -ForegroundColor Red
+    }
+    elseif ($staged.Count -gt 0) {
+        Write-Host "Audit - $($staged.Count) staged setting(s) deploy in observing form" -ForegroundColor Gray
+    }
+    else {
+        # Saying "0 staged settings" invites the reader to wonder what they are missing.
+        Write-Host 'Audit - nothing in this scope is staged, so every setting deploys at its target value' -ForegroundColor Gray
+    }
+    Write-Host ("    Groups    {0}" -f ($Area -join ', ')) -ForegroundColor Gray
+    Write-Host ("    Settings  {0} in scope" -f $inScope.Count) -ForegroundColor Gray
+    Write-Host ("    GPOs      {0}" -f $gpos.Count) -ForegroundColor Gray
+    foreach ($g in $gpos) { Write-Host ("              {0}" -f $g) -ForegroundColor DarkGray }
+
+    if ($MemberOu) { Write-Host ("    Member OU {0}" -f $MemberOu) -ForegroundColor Gray }
+    else { Write-Host '    Member OU not given - member GPOs will be created but left unlinked' -ForegroundColor DarkGray }
+
+    if ($reboot.Count -gt 0) {
+        Write-Host ("    Reboot    {0} setting(s) only take effect after a restart" -f $reboot.Count) -ForegroundColor DarkYellow
+    }
+    if ($scripts.Count -gt 0) {
+        Write-Host ("    Scripts   {0} setting(s) deploy as a GPO startup script and need two restarts to take hold" -f $scripts.Count) -ForegroundColor DarkYellow
+    }
+
+    Write-Host ''
+    if ($Level -eq 'Enforce') {
+        Write-Host '    Enforce is the run that can break authentication. A clean scan should come first.' -ForegroundColor Red
+        Write-Host ''
+    }
+    Write-Host '    Run -Interactive instead to review each topic one at a time, or -Force to skip this prompt.' -ForegroundColor DarkGray
+
+    $answer = (Read-Host '  Write these changes? (y/N)').Trim()
+    return ($answer -and $answer.Substring(0, 1).ToUpper() -eq 'Y')
+}
+
+function Show-HardenMenu {
+    <#
+        .SYNOPSIS
+        The interactive front door: builds the same choices the parameters express.
+
+        .DESCRIPTION
+        Shown only when the script is started without any parameters on an interactive console, so
+        double-clicking into it works while every scripted or scheduled invocation behaves exactly
+        as before - a menu that appeared for a scheduled task would hang it until the timeout.
+
+        Returns a hashtable of parameter overrides, or $null when the person quits. Deliberately
+        produces nothing the command line cannot: the last screen prints the equivalent command,
+        so the menu doubles as a way of learning the parameters rather than replacing them.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host ''
+    Write-Host '  ┌──────────────────────────────────────────────────────────────────┐' -ForegroundColor DarkGray
+    Write-Host '  │  ADHardenKit                                                     │' -ForegroundColor DarkGray
+    Write-Host '  │  Harden the protocol layer of an Active Directory - in order.    │' -ForegroundColor DarkGray
+    Write-Host '  └──────────────────────────────────────────────────────────────────┘' -ForegroundColor DarkGray
+
+    $choice = [ordered]@{}
+
+    # ── what to do ────────────────────────────────────────────────────────────────────────────
+    $mode = Read-HardenMenuChoice -Question 'What should this run do?' -Default '1' -Options @(
+        @{ Key = '1'; Label = 'Scan - read what the domain is doing today'; Detail = 'Read-only. Event logs, NTLM usage, unsigned LDAP binds, current settings.' }
+        @{ Key = '2'; Label = 'Deploy - create and fill the hardening GPOs'; Detail = 'Plans first; nothing is written until you confirm at the end.' }
+        @{ Key = '3'; Label = 'Audit - drift report against a profile'; Detail = 'Read-only. What differs from the selected profile.' }
+        @{ Key = '4'; Label = 'Check - prerequisites only' }
+        @{ Key = 'Q'; Label = 'Quit' }
+    )
+    if ($mode -eq 'Q') { return $null }
+    $choice.Mode = @('Scan', 'Deploy', 'Audit', 'Check')[[int]$mode - 1]
+
+    if ($choice.Mode -in 'Scan', 'Check') {
+        # Nothing else to decide; both are read-only and profile-independent enough.
+        return $choice
+    }
+
+    # ── profile ───────────────────────────────────────────────────────────────────────────────
+    $profile = Read-HardenMenuChoice -Question 'Which profile?' -Default '1' -Options @(
+        @{ Key = '1'; Label = 'Baseline - little or no compatibility risk' }
+        @{ Key = '2'; Label = 'Strict - adds TLS 1.0/1.1 removal, RC4 ciphers, spooler RPC and more'; Detail = 'Needs a maintenance window and a rollback plan.' }
+    )
+    $choice.HardeningProfile = @('Baseline', 'Strict')[[int]$profile - 1]
+
+    if ($choice.Mode -eq 'Audit') { return $choice }
+
+    # ── level ─────────────────────────────────────────────────────────────────────────────────
+    $level = Read-HardenMenuChoice -Question 'Which level?' -Default '1' -Options @(
+        @{ Key = '1'; Label = 'Audit - staged settings deploy in their observing form'; Detail = 'LDAP signing negotiates instead of requiring, NTLM is audited instead of denied.' }
+        @{ Key = '2'; Label = 'Enforce - staged settings actually require'; Detail = 'The run that can break things. A clean scan should come first.' }
+    )
+    $choice.Level = @('Audit', 'Enforce')[[int]$level - 1]
+
+    # ── scope ─────────────────────────────────────────────────────────────────────────────────
+    $allAreas = 'Logging', 'Signing', 'Protocols', 'CredentialProtection', 'LegacyAuth', 'PolicyIntegrity', 'Services'
+    Write-Host ''
+    Write-Host '  Which groups? Comma-separated numbers, or Enter for all.' -ForegroundColor White
+    Write-Host '  On a domain that has never been watched, Logging alone is the right first run.' -ForegroundColor DarkGray
+    for ($i = 0; $i -lt $allAreas.Count; $i++) {
+        Write-Host ('    [{0}] {1}' -f ($i + 1), $allAreas[$i]) -ForegroundColor Gray
+    }
+    while ($true) {
+        $raw = (Read-Host '  Groups').Trim()
+        if ([string]::IsNullOrEmpty($raw)) { $choice.Area = $allAreas; break }
+        $picked = [System.Collections.Generic.List[string]]::new()
+        $valid = $true
+        foreach ($token in ($raw -split '[,\s]+' | Where-Object { $_ })) {
+            $index = 0
+            if ([int]::TryParse($token, [ref]$index) -and $index -ge 1 -and $index -le $allAreas.Count) {
+                if ($allAreas[$index - 1] -notin $picked) { $picked.Add($allAreas[$index - 1]) }
+            }
+            elseif ($token -in $allAreas) {
+                if ($token -notin $picked) { $picked.Add($token) }
+            }
+            else { Write-Host "  '$token' is neither a number from the list nor a group name." -ForegroundColor Red; $valid = $false; break }
+        }
+        if ($valid -and $picked.Count -gt 0) { $choice.Area = $picked.ToArray(); break }
+    }
+
+    # ── member server OU ──────────────────────────────────────────────────────────────────────
+    Write-Host ''
+    Write-Host '  OU to link the member server GPOs to. Enter to skip - the GPOs are then' -ForegroundColor White
+    Write-Host '  created but left unlinked, and can be linked in a later run.' -ForegroundColor DarkGray
+    $ad = Get-HardenAdParameter
+    while ($true) {
+        $ou = (Read-Host '  Member server OU (distinguished name)').Trim().Trim('"', "'")
+        if ([string]::IsNullOrEmpty($ou)) { break }
+        try {
+            Get-ADObject -Identity $ou @ad -ErrorAction Stop | Out-Null
+            $choice.MemberServerOu = $ou
+            break
+        }
+        catch {
+            Write-Host "  Not found in the directory: $ou" -ForegroundColor Red
+            Write-Host '  Enter to skip, or try again.' -ForegroundColor DarkGray
+        }
+    }
+
+    # ── walkthrough and writing ───────────────────────────────────────────────────────────────
+    $walk = Read-HardenMenuChoice -Question 'Show each topic for confirmation before it is deployed?' -Default '1' -Options @(
+        @{ Key = '1'; Label = 'Yes - one card per topic with its current state and explanation' }
+        @{ Key = '2'; Label = 'No - deploy everything in the selected scope' }
+    )
+    $choice.Interactive = ($walk -eq '1')
+
+    $write = Read-HardenMenuChoice -Question 'Plan only, or write?' -Default '1' -Options @(
+        @{ Key = '1'; Label = 'Plan - show everything, change nothing' }
+        @{ Key = '2'; Label = 'Apply - actually create and link the GPOs' }
+    )
+    $choice.Apply = ($write -eq '2')
+
+    # ── summary and the equivalent command line ───────────────────────────────────────────────
+    # Not $MyInvocation: inside a function that names the function, not the script file.
+    $cmd = if ($PSCommandPath) { ".\$(Split-Path $PSCommandPath -Leaf)" } else { '.\ADHardenKit.ps1' }
+    $cmd += " -Mode $($choice.Mode)"
+    if ($choice.Contains('HardeningProfile') -and $choice.HardeningProfile -ne 'Baseline') { $cmd += " -Profile $($choice.HardeningProfile)" }
+    if ($choice.Contains('Level') -and $choice.Level -ne 'Audit') { $cmd += " -Level $($choice.Level)" }
+    if ($choice.Contains('Area') -and @($choice.Area).Count -lt $allAreas.Count) { $cmd += " -Area $($choice.Area -join ',')" }
+    if ($choice.Contains('MemberServerOu')) { $cmd += " -MemberServerOu '$($choice.MemberServerOu)'" }
+    if ($choice.Contains('Interactive') -and $choice.Interactive) { $cmd += ' -Interactive' }
+    if ($choice.Contains('Apply') -and $choice.Apply) { $cmd += ' -Apply' }
+
+    Write-Host ''
+    Write-Host '  The same run as a command line, for a script or a scheduled task:' -ForegroundColor DarkGray
+    Write-Host "    $cmd" -ForegroundColor Cyan
+    Write-Host ''
+
+    $go = Read-HardenMenuChoice -Question 'Run it?' -Default 'Y' -Options @(
+        @{ Key = 'Y'; Label = 'Yes' }
+        @{ Key = 'N'; Label = 'No - back to the start' }
+        @{ Key = 'Q'; Label = 'Quit' }
+    )
+    if ($go -eq 'Q') { return $null }
+    if ($go -eq 'N') { return Show-HardenMenu }
+    return $choice
+}
+
+#endregion Menu
+
+####################################################################################################
 #region Entry point
 ####################################################################################################
 
 $started = Get-Date
 $exitCode = 0
 
+# Argument validation before anything else runs. Deploy-only switches in a mode that cannot honour
+# them are almost always a forgotten -Mode Deploy, and carrying on with the scan would be worse
+# than an error: the person reads a successful-looking run and walks away believing something was
+# deployed. -Area alone stays permitted, because a scoped scan is coherent.
+# Checked here rather than after the prerequisites so the failure is not buried under half a
+# screen of unrelated green ticks.
+if ($Mode -ne 'Deploy' -and ($Apply -or $Interactive -or $MemberServerOu)) {
+    $flags = @(
+        if ($Apply) { '-Apply' }
+        if ($Interactive) { '-Interactive' }
+        if ($MemberServerOu) { '-MemberServerOu' }
+    ) -join ', '
+
+    $script = if ($PSCommandPath) { Split-Path $PSCommandPath -Leaf } else { 'ADHardenKit.ps1' }
+    $suggest = ".\$script -Mode Deploy"
+    if ($PSBoundParameters.ContainsKey('Area')) { $suggest += " -Area $($Area -join ',')" }
+    if ($MemberServerOu) { $suggest += " -MemberServerOu '$MemberServerOu'" }
+    if ($Interactive) { $suggest += ' -Interactive' }
+    if ($Apply) { $suggest += ' -Apply' }
+
+    Write-Host ''
+    Write-Host "  $flags only has meaning in Deploy mode." -ForegroundColor Red
+    # The "you forgot -Mode" hint is only true when they actually left it out. Saying it to
+    # someone who typed -Mode Audit reads as the tool not having noticed what they wrote.
+    $why = if ($PSBoundParameters.ContainsKey('Mode')) { "This run is in $Mode mode" }
+    else { "This run is in Scan mode, which is the default when -Mode is not given" }
+    Write-Host "  $why, so nothing was done." -ForegroundColor Red
+    Write-Host ''
+    Write-Host '  Probably meant:' -ForegroundColor DarkGray
+    Write-Host "    $suggest" -ForegroundColor Cyan
+    Write-Host ''
+    exit 3
+}
+
 # Everything the report needs to say what this run was, in one place rather than assembled
 # differently at each of the four call sites.
 $runParameters = [ordered]@{
+    Version        = $script:HardenKitVersion
     Mode           = $Mode
     Profile        = $HardeningProfile
     Level          = $Level
@@ -2756,7 +3561,7 @@ $runParameters = [ordered]@{
 }
 
 Initialize-HardenLog -LogDirectory $LogDirectory | Out-Null
-Write-HardenLog -Message 'ADHardenKit' -Level Header
+Write-HardenLog -Message "ADHardenKit $script:HardenKitVersion" -Level Header
 
 try {
     Initialize-HardenContext -Server $Server | Out-Null
@@ -2774,6 +3579,29 @@ if (-not (Test-HardenPrerequisite)) {
     exit 3
 }
 
+
+# The menu is the front door for a person, never for a machine: it appears only when the script
+# was started with no parameters at all on a console that can answer. Any parameter - even one -
+# means the caller knew what they wanted, and -NoMenu covers the deliberate parameterless scan.
+if ($PSBoundParameters.Count -eq 0 -and -not $NoMenu -and [Environment]::UserInteractive) {
+    $menuChoice = Show-HardenMenu
+    if ($null -eq $menuChoice) {
+        Write-HardenLog -Message 'Nothing selected - nothing done.' -Level Info
+        exit 0
+    }
+    foreach ($key in $menuChoice.Keys) {
+        Set-Variable -Name $key -Value $menuChoice[$key] -Scope Script
+    }
+    # The report must describe what actually ran, not the pre-menu defaults.
+    $runParameters['Mode'] = $Mode
+    $runParameters['Profile'] = $HardeningProfile
+    $runParameters['Level'] = $Level
+    $runParameters['Area'] = $Area
+    $runParameters['Apply'] = [bool]$Apply
+    $runParameters['Interactive'] = [bool]$Interactive
+    $runParameters['MemberServerOu'] = $MemberServerOu
+}
+
 switch ($Mode) {
 
     'Check' {
@@ -2787,7 +3615,7 @@ switch ($Mode) {
         if ($Interactive) {
             Write-HardenLog -Message '-Interactive only applies to Deploy mode. Scan changes nothing, so there is nothing to confirm.' -Level Info
         }
-        $blockers = @(Invoke-HardenScan -Days $ScanDays -Level $Level)
+        $blockers = @(Invoke-HardenScan -Days $ScanDays -Level $Level -Area $Area)
         $summary = New-HardenSummary -Mode 'Scan' -Started $started -Context (Get-HardenContext) `
             -RunParameters $runParameters -Baseline (Get-HardenBaseline | Where-Object { $_.Group -in $Area }) `
             -AuditPolicy (Get-HardenAuditPolicy) -Blockers $blockers
@@ -2806,6 +3634,16 @@ switch ($Mode) {
 
         if ($Level -eq 'Enforce' -and -not $Force) {
             Write-HardenLog -Message 'Level Enforce was requested. Run -Mode Scan first and read the result - this is the run that can break things.' -Level Warning
+        }
+
+        # The brake for the unattended sharp run. Not shown with -Interactive, where every topic is
+        # confirmed anyway, nor with -Force, nor on a host with no console.
+        if ($Apply -and -not $Interactive -and -not $Force -and [Environment]::UserInteractive) {
+            if (-not (Confirm-HardenApply -HardeningProfile $HardeningProfile -Level $Level -Area $Area `
+                        -GpoNamePattern $GpoNamePattern -MemberOu $MemberServerOu)) {
+                Write-HardenLog -Message 'Not confirmed - nothing was written.' -Level Info
+                exit 0
+            }
         }
 
         if ($Interactive) {
