@@ -10,7 +10,7 @@
 [![Platform](https://img.shields.io/badge/Windows_Server-2016%2B-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#prerequisites)
 ![Lab tested](https://img.shields.io/badge/lab_tested-Server_2025-2ea44f?style=for-the-badge)
 [![Settings](https://img.shields.io/badge/80_settings-32_topics-6f42c1?style=for-the-badge)](#what-it-deploys)
-[![License](https://img.shields.io/badge/license-MIT-555555?style=for-the-badge)](LICENSE)
+[![License](https://img.shields.io/badge/license-GPLv3-555555?style=for-the-badge)](LICENSE)
 
 <br>
 
@@ -372,7 +372,7 @@ the estate.
 ```
 ADHardenKit.ps1                  the entire tool
 Verify-LoggingDeployment.ps1     post-deployment verification for the Logging group
-README.md · LICENSE
+README.md · CHANGELOG.md · LICENSE
 Logs/ · Reports/                 created on first run
 ```
 
@@ -386,7 +386,15 @@ built from. Changing what this tool hardens means editing a table.
 
 ## License
 
-[MIT](LICENSE)
+[GNU General Public License v3.0](LICENSE)
+
+Copyright (C) 2026 nopcap.tech
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU
+General Public License as published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version. It is distributed in the hope that it will be
+useful, but **without any warranty** — without even the implied warranty of merchantability or
+fitness for a particular purpose. See the licence for details.
 
 <div align="center">
 <br>

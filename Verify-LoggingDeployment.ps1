@@ -1,3 +1,6 @@
+﻿# Part of ADHardenKit. Copyright (C) 2026 nopcap.tech
+# Licensed under the GNU General Public License v3.0 or later. See LICENSE.
+
 <#
     .SYNOPSIS
     Checks whether the ADHardenKit Logging GPO actually took effect on this domain controller.

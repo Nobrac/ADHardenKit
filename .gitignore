@@ -1,0 +1,7 @@
+# Runtime output - contains domain names, host names and account names
+Logs/
+Reports/
+
+# Windows
+Thumbs.db
+desktop.ini

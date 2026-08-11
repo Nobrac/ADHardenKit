@@ -1,3 +1,17 @@
+﻿# ADHardenKit - hardens the protocol layer of an Active Directory domain.
+# Copyright (C) 2026 nopcap.tech
+#
+# This program is free software: you can redistribute it and/or modify it under the terms of the
+# GNU General Public License as published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+# without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along with this program.
+# If not, see <https://www.gnu.org/licenses/>.
+
 <#
     .SYNOPSIS
     Hardens the protocol layer of an Active Directory domain: signing, credential exposure,
@@ -85,6 +99,32 @@
     A or S applies one decision to everything remaining, because a prompt nobody can dismiss is a
     prompt nobody reads. Without this switch the run is unattended, which is what a scheduled task
     needs.
+
+    .PARAMETER HardeningProfile
+    Baseline or Strict. Baseline carries little or no compatibility risk; Strict adds the settings
+    that need a maintenance window - TLS 1.0/1.1 and the weak ciphers off, NTLM restriction, the
+    Kerberos encryption types, cached logon counts. Aliased as -Profile.
+
+    .PARAMETER Server
+    Domain controller to read from and write to. Defaults to the PDC emulator, so a run that is
+    interrupted and repeated targets the same server rather than whichever one answers.
+
+    .PARAMETER GpoNamePattern
+    Naming scheme for the GPOs, with the placeholders {ROLE} and {GROUP}. Default
+    ADHardenKit-{ROLE}-{GROUP}, giving names like ADHardenKit-DC-Signing.
+
+    .PARAMETER ScanDays
+    How far back Scan reads the event logs. Default 30.
+
+    .PARAMETER LogDirectory
+    Where the per-run transcript goes. Default .\Logs
+
+    .PARAMETER ReportDirectory
+    Where the JSON and HTML reports go. Default .\Reports
+
+    .PARAMETER NoEventLog
+    Skip the event log analysis in Scan mode. Useful on a domain controller where the logs are
+    large enough that reading them takes longer than the rest of the run.
 
     .PARAMETER MemberServerOu
     Distinguished name of the OU the member server GPOs are linked to. Without it they are created
@@ -186,7 +226,7 @@ param(
 
 # Bumped whenever the baseline or a mechanism changes. Printed on every run and carried into the
 # report, so "which version produced this" is answerable from a pasted log rather than guessed at.
-$script:HardenKitVersion = '1.8.0'
+$script:HardenKitVersion = '1.0.0'
 
 $ErrorActionPreference = 'Stop'
 
@@ -435,7 +475,7 @@ function Get-HardenBaseline {
 
     $s = [System.Collections.Generic.List[object]]::new()
 
-    # ── Signing and channel binding ────────────────────────────────────────────────────────────
+    # -- Signing and channel binding ------------------------------------------------------------
     $s.Add([ordered]@{
             Id = 'LDAP-ServerSigning'; Topic = 'LDAP signing and channel binding'; Reference = 'KB4520412, ADV190023, CVE-2017-8563'; Group = 'Signing'; Name = 'LDAP server requires signing'
             Type = 'SecurityOption'; Target = 'DC'; Profile = 'Baseline'; Staged = $true
@@ -494,7 +534,7 @@ function Get-HardenBaseline {
             Why = 'The secure channel between a member and its DC must be signed or sealed. Enforced by default since the Zerologon patches; setting it explicitly means a rebuilt machine cannot end up without it.'
         })
 
-    # ── Legacy authentication ──────────────────────────────────────────────────────────────────
+    # -- Legacy authentication ------------------------------------------------------------------
     $s.Add([ordered]@{
             Id = 'LM-CompatibilityLevel'; Topic = 'NTLM version and session security'; Group = 'LegacyAuth'; Name = 'NTLMv2 only, refuse LM and NTLM'
             Type = 'SecurityOption'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
@@ -557,7 +597,7 @@ function Get-HardenBaseline {
             Observe = 'System log on the domain controllers, events 39, 40 and 41 name certificates with a weak mapping.'
         })
 
-    # ── Credential exposure ────────────────────────────────────────────────────────────────────
+    # -- Credential exposure --------------------------------------------------------------------
     $s.Add([ordered]@{
             Id = 'LSA-RunAsPPL'; Topic = 'LSA protection'; NeedsReboot = $true; Group = 'CredentialProtection'; Name = 'LSA protection (RunAsPPL)'
             Type = 'SecurityOption'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
@@ -609,7 +649,7 @@ function Get-HardenBaseline {
             Observe = 'A domain controller restricts remote SAM to administrators regardless - the DISA STIG marks this check not applicable on DCs for that reason. Setting it explicitly still has value on member servers, where an absent value means no restriction at all.'
         })
 
-    # ── Administrative templates (registry policy) ─────────────────────────────────────────────
+    # -- Administrative templates (registry policy) ---------------------------------------------
     $s.Add([ordered]@{
             Id = 'CredentialGuard'; Topic = 'Credential Guard and VBS'; NeedsReboot = $true; Group = 'CredentialProtection'; Name = 'Credential Guard with VBS'
             Type = 'AdminTemplate'; Target = 'Member'; Profile = 'Baseline'; Staged = $false
@@ -708,7 +748,7 @@ function Get-HardenBaseline {
             Why = 'The default dependency list still names MRxSmb10. Disable that driver without removing it from here and the Workstation service fails to start on the next reboot, which takes the machine off the domain in every way that matters. Microsoft documents this pair together; they must never be deployed apart.'
         })
 
-    # ── Schannel: the channel everything else rides on ─────────────────────────────────────────
+    # -- Schannel: the channel everything else rides on -----------------------------------------
     # LDAPS, RDP and WinRM all terminate in Schannel, so hardening the protocols above it while
     # leaving TLS 1.0 enabled underneath is a gap rather than a layering choice.
     #
@@ -808,7 +848,7 @@ function Get-HardenBaseline {
             Why = 'A 64-bit block cipher, which is what makes the Sweet32 birthday attack practical on long-lived connections.'
         })
 
-    # ── The Schannel half of the certificate binding story ─────────────────────────────────────
+    # -- The Schannel half of the certificate binding story -------------------------------------
     $s.Add([ordered]@{
             Id = 'Schannel-CertificateMapping'; DefaultWhenUnset = 24
             Topic = 'Certificate binding for Kerberos'; Group = 'LegacyAuth'
@@ -821,7 +861,7 @@ function Get-HardenBaseline {
             Observe = 'Already the default since KB5014754, so this normally changes nothing. It is here because the value that gets set back to 0x1F to work around a certificate problem is the one nobody remembers to undo, and nothing in the directory reports it.'
         })
 
-    # ── Remote Desktop ─────────────────────────────────────────────────────────────────────────
+    # -- Remote Desktop -------------------------------------------------------------------------
     $s.Add([ordered]@{
             Id = 'Rdp-SecureTransport'; Topic = 'Remote Desktop'; Group = 'CredentialProtection'
             Name = 'RDP requires NLA, TLS and high encryption'
@@ -857,7 +897,7 @@ function Get-HardenBaseline {
             Why = 'Lets an administrator connect with Remote Credential Guard, where the Kerberos requests are sent back to the originating machine instead of the credentials being placed on the target. An administrative session on a server then leaves nothing behind that is worth stealing.'
         })
 
-    # ── Point and Print ────────────────────────────────────────────────────────────────────────
+    # -- Point and Print ------------------------------------------------------------------------
     # The spooler is disabled outright on domain controllers further down. On member servers it
     # usually has to keep running, and this is what makes that survivable.
     $s.Add([ordered]@{
@@ -886,7 +926,7 @@ function Get-HardenBaseline {
             Observe = 'Do not deploy this to an actual print server - it is exactly the function that machine exists to provide. Scope it with a separate OU or exclude the print servers from the link.'
         })
 
-    # ── Services ───────────────────────────────────────────────────────────────────────────────
+    # -- Services -------------------------------------------------------------------------------
     $s.Add([ordered]@{
             Id = 'Service-Spooler-DC'; Topic = 'Print spooler on domain controllers'; Group = 'Services'; Name = 'Print Spooler disabled on domain controllers'
             Type = 'Service'; Target = 'DC'; Profile = 'Baseline'; Staged = $false
@@ -895,7 +935,7 @@ function Get-HardenBaseline {
             Observe = 'Only breaks things if someone genuinely prints from a DC, which they should not.'
         })
 
-    # ── Additions after reading HardenAD's shipped policy templates ───────────────────────────
+    # -- Additions after reading HardenAD's shipped policy templates ---------------------------
     # Their GPO backups set a number of things this baseline had missed. These are the ones worth
     # having; the rest were workstation concerns or risk without much return.
 
@@ -1050,7 +1090,7 @@ function Get-HardenBaseline {
             Why = 'Without this a legacy audit category set anywhere in the estate silently overrides the whole advanced audit policy, and the careful subcategory list deploys to nothing. This is the setting that makes the rest of the logging group actually take effect.'
         })
 
-    # ── Second pass over HardenAD, this time the registry.pol files in their GPO backups ───────
+    # -- Second pass over HardenAD, this time the registry.pol files in their GPO backups -------
     # The security templates only carry Security Options. The administrative templates sat in the
     # policy files next to them and had a good deal that this baseline was missing.
 
@@ -2157,7 +2197,7 @@ function Invoke-HardenScan {
     $dcs = @(Get-ADDomainController -Filter * @ad -ErrorAction SilentlyContinue)
     Write-HardenLog -Message "$($dcs.Count) domain controller(s) in $($ctx.DomainFqdn)" -Level Info
 
-    # ── unsigned LDAP binds ───────────────────────────────────────────────────────────────────
+    # -- unsigned LDAP binds -------------------------------------------------------------------
     Write-HardenLog -Message 'Unsigned and unsealed LDAP binds' -Level Header
     $ldapTotal = 0
     foreach ($dc in $dcs) {
@@ -2206,7 +2246,7 @@ function Invoke-HardenScan {
         Write-HardenLog -Message 'No unsigned binds recorded. Note that this only counts if event 2889 logging was already on - see LDAP diagnostics below.' -Level Info
     }
 
-    # ── is the diagnostic even enabled? ───────────────────────────────────────────────────────
+    # -- is the diagnostic even enabled? -------------------------------------------------------
     Write-HardenLog -Message 'LDAP interface diagnostics' -Level Header
     foreach ($dc in $dcs) {
         try {
@@ -2227,7 +2267,7 @@ function Invoke-HardenScan {
         }
     }
 
-    # ── NTLM usage ────────────────────────────────────────────────────────────────────────────
+    # -- NTLM usage ----------------------------------------------------------------------------
     Write-HardenLog -Message 'NTLM authentication' -Level Header
     $ntlmTotal = 0
     $ntlmByEvent = @{}
@@ -2340,7 +2380,7 @@ function Invoke-HardenScan {
         }
     }
 
-    # ── accounts that cannot do AES ───────────────────────────────────────────────────────────
+    # -- accounts that cannot do AES -----------------------------------------------------------
     Write-HardenLog -Message 'Kerberos encryption support' -Level Header
     try {
         # msDS-SupportedEncryptionTypes: bit 0x4 is RC4, 0x8 and 0x10 are AES128 and AES256.
@@ -2368,7 +2408,7 @@ function Invoke-HardenScan {
         Write-HardenLog -Message "Encryption type check failed - $($_.Exception.Message)" -Level Warning
     }
 
-    # ── krbtgt password age ───────────────────────────────────────────────────────────────────
+    # -- krbtgt password age -------------------------------------------------------------------
     Write-HardenLog -Message 'krbtgt password age' -Level Header
     try {
         $krbtgt = Get-ADUser -Identity "$($ctx.DomainSid)-502" -Properties PasswordLastSet, whenCreated @ad -ErrorAction Stop
@@ -2405,7 +2445,7 @@ function Invoke-HardenScan {
         Add-HardenAction -Area 'Scan' -Setting 'krbtgt-PasswordAge' -Target $ctx.DomainFqdn -Result 'Failed' -Detail $_.Exception.Message
     }
 
-    # ── what is set today ─────────────────────────────────────────────────────────────────────
+    # -- what is set today ---------------------------------------------------------------------
     # Scoped, because being asked about one group and answered about all seven is how a report
     # gets skimmed. The event log sections above stay unscoped on purpose - they describe the
     # domain, not a group, and their findings are what gate any later enforcement.
@@ -2482,7 +2522,7 @@ function Invoke-HardenScan {
         }
     }
 
-    # ── verdict ───────────────────────────────────────────────────────────────────────────────
+    # -- verdict -------------------------------------------------------------------------------
     Write-HardenLog -Message 'Verdict' -Level Header
     if ($blockers.Count -eq 0) {
         Write-HardenLog -Message 'Nothing found that would obviously break. That is not the same as nothing breaking - deploy at Level Audit first anyway.' -Level Success
@@ -2578,7 +2618,7 @@ function Invoke-HardenDeployment {
                 }
             }
 
-            # ── one question per topic, with the live state next to the target ────────────────
+            # -- one question per topic, with the live state next to the target ----------------
             if ($script:InteractiveMode) {
                 $promptItems = [System.Collections.Generic.List[object]]::new()
                 foreach ($it in $applicable) { $promptItems.Add($it) }
@@ -2604,7 +2644,7 @@ function Invoke-HardenDeployment {
                 }
             }
 
-            # ── security options and services share one template per GPO ──────────────────────
+            # -- security options and services share one template per GPO ----------------------
             $registryValues = @{}
             $services = @{}
 
@@ -2701,7 +2741,7 @@ function Invoke-HardenDeployment {
                 }
             }
 
-            # ── advanced audit policy, in the Logging GPO ─────────────────────────────────────
+            # -- advanced audit policy, in the Logging GPO -------------------------------------
             if ($wantsAuditCsv) {
                 try {
                     $result = Set-HardenAuditCsv -Gpo $creation.Gpo -Subcategories $auditPolicy -Role $role -AuditOnly:$AuditOnly -Confirm:$false
@@ -2715,7 +2755,7 @@ function Invoke-HardenDeployment {
                 }
             }
 
-            # ── link ─────────────────────────────────────────────────────────────────────────
+            # -- link -------------------------------------------------------------------------
             if (-not $targetDn) {
                 # Not knowing where to look is not the same as nothing being there. Reporting a
                 # link as missing because the caller omitted -MemberServerOu turns an operator
@@ -2822,7 +2862,7 @@ function New-HardenReport {
 
     $e = { param($t) ConvertTo-HardenHtmlText ([string]$t) }
 
-    # ── verdict ───────────────────────────────────────────────────────────────────────────────
+    # -- verdict -------------------------------------------------------------------------------
     $mode = [string]$Summary.Mode
     if ($Summary.Failed -gt 0) {
         $vClass = 'bad'; $vTitle = "$($Summary.Failed) operation(s) failed"
@@ -2864,7 +2904,7 @@ function New-HardenReport {
         }
     }
 
-    # ── stat tiles ────────────────────────────────────────────────────────────────────────────
+    # -- stat tiles ----------------------------------------------------------------------------
     $tileDefs = @(
         @{ Key = 'Created'; Label = 'Created'; Tone = 'ok' }
         @{ Key = 'Updated'; Label = 'Updated'; Tone = 'ok' }
@@ -2881,7 +2921,7 @@ function New-HardenReport {
         '<div class="tile t-{0}"><span class="num">{1}</span><span class="lbl">{2}</span></div>' -f $t.Tone, $v, (& $e $t.Label)
     }
 
-    # ── run facts ─────────────────────────────────────────────────────────────────────────────
+    # -- run facts -----------------------------------------------------------------------------
     $p = $Summary.Parameters
     $facts = [ordered]@{
         'ADHardenKit'      = $(if ($p -and $p['Version']) { $p['Version'] } else { 'unknown' })
@@ -2902,7 +2942,7 @@ function New-HardenReport {
         '<div class="fact"><dt>{0}</dt><dd>{1}</dd></div>' -f (& $e $k), (& $e $facts[$k])
     }
 
-    # ── blockers ──────────────────────────────────────────────────────────────────────────────
+    # -- blockers ------------------------------------------------------------------------------
     $blockerHtml = ''
     if ($Summary.Blockers.Count -gt 0) {
         $items = foreach ($b in $Summary.Blockers) { '<li>{0}</li>' -f (& $e $b) }
@@ -2915,7 +2955,7 @@ function New-HardenReport {
 "@
     }
 
-    # ── what was touched, grouped by topic ────────────────────────────────────────────────────
+    # -- what was touched, grouped by topic ----------------------------------------------------
     $topicHtml = ''
     if ($Summary.Baseline.Count -gt 0) {
         $byTopic = $Summary.Baseline | Group-Object { $_.Topic } | Sort-Object Name
@@ -2968,7 +3008,7 @@ function New-HardenReport {
 "@
     }
 
-    # ── audit policy appendix ─────────────────────────────────────────────────────────────────
+    # -- audit policy appendix -----------------------------------------------------------------
     $auditHtml = ''
     if ($Summary.AuditPolicy.Count -gt 0) {
         $ar = foreach ($sub in $Summary.AuditPolicy) {
@@ -2988,7 +3028,7 @@ function New-HardenReport {
 "@
     }
 
-    # ── action table ──────────────────────────────────────────────────────────────────────────
+    # -- action table --------------------------------------------------------------------------
     $order = @{ High = 0; Medium = 1; Low = 2; Info = 3 }
     $sorted = $Summary.Actions | Sort-Object @{ Expression = { $order[[string]$_.Severity] } }, Area, Setting
     $rows = foreach ($action in $sorted) {
@@ -3004,7 +3044,7 @@ function New-HardenReport {
         (& $e $action.Target), $resClass, (& $e $res), (& $e $action.Detail)
     }
 
-    # ── next steps ────────────────────────────────────────────────────────────────────────────
+    # -- next steps ----------------------------------------------------------------------------
     $steps = [System.Collections.Generic.List[string]]::new()
     if ($Summary.Failed -gt 0) { $steps.Add('Resolve the failed operations above and re-run. The run is idempotent - what already succeeded will report as already correct.') }
     if ($mode -eq 'WhatIf') { $steps.Add('Re-run the same command with <code>-Apply</code> to deploy what is listed here.') }
@@ -3422,14 +3462,16 @@ function Show-HardenMenu {
     param()
 
     Write-Host ''
-    Write-Host '  ┌──────────────────────────────────────────────────────────────────┐' -ForegroundColor DarkGray
-    Write-Host '  │  ADHardenKit                                                     │' -ForegroundColor DarkGray
-    Write-Host '  │  Harden the protocol layer of an Active Directory - in order.    │' -ForegroundColor DarkGray
-    Write-Host '  └──────────────────────────────────────────────────────────────────┘' -ForegroundColor DarkGray
+    # ASCII, not box drawing: this is the first thing anyone sees, and the console it renders in
+    # is not always a UTF-8 one. A banner of question marks is a bad first impression.
+    Write-Host ('  ' + ('=' * 68)) -ForegroundColor DarkGray
+    Write-Host "   ADHardenKit $script:HardenKitVersion" -ForegroundColor White
+    Write-Host '   Harden the protocol layer of an Active Directory - in order.' -ForegroundColor DarkGray
+    Write-Host ('  ' + ('=' * 68)) -ForegroundColor DarkGray
 
     $choice = [ordered]@{}
 
-    # ── what to do ────────────────────────────────────────────────────────────────────────────
+    # -- what to do ----------------------------------------------------------------------------
     $mode = Read-HardenMenuChoice -Question 'What should this run do?' -Default '1' -Options @(
         @{ Key = '1'; Label = 'Scan - read what the domain is doing today'; Detail = 'Read-only. Event logs, NTLM usage, unsigned LDAP binds, current settings.' }
         @{ Key = '2'; Label = 'Deploy - create and fill the hardening GPOs'; Detail = 'Plans first; nothing is written until you confirm at the end.' }
@@ -3445,7 +3487,7 @@ function Show-HardenMenu {
         return $choice
     }
 
-    # ── profile ───────────────────────────────────────────────────────────────────────────────
+    # -- profile -------------------------------------------------------------------------------
     $profile = Read-HardenMenuChoice -Question 'Which profile?' -Default '1' -Options @(
         @{ Key = '1'; Label = 'Baseline - little or no compatibility risk' }
         @{ Key = '2'; Label = 'Strict - adds TLS 1.0/1.1 removal, RC4 ciphers, spooler RPC and more'; Detail = 'Needs a maintenance window and a rollback plan.' }
@@ -3454,14 +3496,14 @@ function Show-HardenMenu {
 
     if ($choice.Mode -eq 'Audit') { return $choice }
 
-    # ── level ─────────────────────────────────────────────────────────────────────────────────
+    # -- level ---------------------------------------------------------------------------------
     $level = Read-HardenMenuChoice -Question 'Which level?' -Default '1' -Options @(
         @{ Key = '1'; Label = 'Audit - staged settings deploy in their observing form'; Detail = 'LDAP signing negotiates instead of requiring, NTLM is audited instead of denied.' }
         @{ Key = '2'; Label = 'Enforce - staged settings actually require'; Detail = 'The run that can break things. A clean scan should come first.' }
     )
     $choice.Level = @('Audit', 'Enforce')[[int]$level - 1]
 
-    # ── scope ─────────────────────────────────────────────────────────────────────────────────
+    # -- scope ---------------------------------------------------------------------------------
     $allAreas = 'Logging', 'Signing', 'Protocols', 'CredentialProtection', 'LegacyAuth', 'PolicyIntegrity', 'Services'
     Write-Host ''
     Write-Host '  Which groups? Comma-separated numbers, or Enter for all.' -ForegroundColor White
@@ -3487,7 +3529,7 @@ function Show-HardenMenu {
         if ($valid -and $picked.Count -gt 0) { $choice.Area = $picked.ToArray(); break }
     }
 
-    # ── member server OU ──────────────────────────────────────────────────────────────────────
+    # -- member server OU ----------------------------------------------------------------------
     Write-Host ''
     Write-Host '  OU to link the member server GPOs to. Enter to skip - the GPOs are then' -ForegroundColor White
     Write-Host '  created but left unlinked, and can be linked in a later run.' -ForegroundColor DarkGray
@@ -3506,7 +3548,7 @@ function Show-HardenMenu {
         }
     }
 
-    # ── walkthrough and writing ───────────────────────────────────────────────────────────────
+    # -- walkthrough and writing ---------------------------------------------------------------
     $walk = Read-HardenMenuChoice -Question 'Show each topic for confirmation before it is deployed?' -Default '1' -Options @(
         @{ Key = '1'; Label = 'Yes - one card per topic with its current state and explanation' }
         @{ Key = '2'; Label = 'No - deploy everything in the selected scope' }
@@ -3519,7 +3561,7 @@ function Show-HardenMenu {
     )
     $choice.Apply = ($write -eq '2')
 
-    # ── summary and the equivalent command line ───────────────────────────────────────────────
+    # -- summary and the equivalent command line -----------------------------------------------
     # Not $MyInvocation: inside a function that names the function, not the script file.
     $cmd = if ($PSCommandPath) { ".\$(Split-Path $PSCommandPath -Leaf)" } else { '.\ADHardenKit.ps1' }
     $cmd += " -Mode $($choice.Mode)"
