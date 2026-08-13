@@ -226,7 +226,7 @@ param(
 
 # Bumped whenever the baseline or a mechanism changes. Printed on every run and carried into the
 # report, so "which version produced this" is answerable from a pasted log rather than guessed at.
-$script:HardenKitVersion = '1.0.0'
+$script:HardenKitVersion = '1.1.0'
 
 $ErrorActionPreference = 'Stop'
 
@@ -580,12 +580,35 @@ function Get-HardenBaseline {
         })
 
     $s.Add([ordered]@{
+            Id = 'Kerberos-ArmoringKdc'; Topic = 'Kerberos armoring'; Group = 'LegacyAuth'
+            Name = 'KDC advertises claims and armoring'
+            Type = 'AdminTemplate'; Target = 'DC'; Profile = 'Baseline'; Staged = $false
+            RegKey = 'HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\System\KDC\Parameters'
+            Values = @(
+                @{ Name = 'EnableCbacAndArmor'; Type = 'DWord'; Value = 1 }
+                @{ Name = 'CbacAndArmorLevel'; Type = 'DWord'; Value = 0 }
+            )
+            Why = 'Kerberos armoring is Microsoft implementation of FAST: it encrypts the Kerberos exchange itself and signs the errors, which removes the offline attack on AS-REP material. On its own that is worth having. The larger reason to turn it on early is that Authentication Policies - the mechanism that says a tier 0 account may only obtain a ticket from a tier 0 machine - do not work without it. Enabling armoring is the cheap step; needing it later and not having it is the expensive one.'
+            Observe = 'Deployed at level 0, Supported: the KDC advertises the capability and uses it with clients that can, and nothing is refused. That is enough for Authentication Policies and breaks nothing. Level 1, Always provide claims, adds claims to every ticket and grows them - check MaxTokenSize before going there. Level 2, Fail unarmored authentication requests, is the end state and refuses any client that cannot armor; below domain functional level 2012 both behave as Supported anyway. Raise the level by hand once the client side below is deployed everywhere and the Kerberos operational log stays quiet.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'Kerberos-ArmoringClient'; Topic = 'Kerberos armoring'; Group = 'LegacyAuth'
+            Name = 'Kerberos client supports claims and armoring'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
+            RegKey = 'HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters'
+            Values = @(@{ Name = 'EnableCbacAndArmor'; Type = 'DWord'; Value = 1 })
+            Why = 'The other half. A KDC that offers armoring and clients that never ask for it is the same as no armoring at all - the KDC setting alone changes nothing.'
+            Observe = 'Target is Both, and the domain controllers are deliberately included: a DC is also a Kerberos client, and leaving this off there is the mistake that gets made most often. Needs Windows 8 or Server 2012 and later; older systems ignore it.'
+        })
+
+    $s.Add([ordered]@{
             Id = 'Kerberos-AesOnly'; Topic = 'Kerberos encryption types'; Reference = 'KB5021131, CVE-2022-37966, CVE-2026-20833'; Group = 'LegacyAuth'; Name = 'Kerberos: AES only, no RC4'
             Type = 'SecurityOption'; Target = 'Both'; Profile = 'Strict'; Staged = $true
             Key = 'MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters\SupportedEncryptionTypes'
             ValueType = 4; AuditValue = 2147483644; EnforceValue = 2147483640
             Why = '0x7FFFFFF8 is AES128, AES256 and the reserved future types, with DES and RC4 left out. Plain 0x18 would also work today but drops the future bits, so a machine that learns a new encryption type in a later build would refuse to use it. The audit form 0x7FFFFFFC keeps RC4 available while the AES rollout is verified.'
-            Observe = 'Scan lists accounts whose msDS-SupportedEncryptionTypes still allows RC4. Note that this is only the member-side policy; since the January 2026 update the KDC side is governed by DefaultDomainSupportedEncTypes, which now defaults to 0x18, and RC4DefaultDisablementPhase stopped being read with the July 2026 updates.'
+            Observe = 'Changing this does not take effect until the password changes: the keys are derived from the cleartext password when it is set, so an account whose password predates the change still only has the old key material. Plan a password rotation for service accounts alongside it, and note that an account left with only RC4 keys cannot obtain a ticket at all once RC4 is disallowed. Windows also translates the registry value back when it writes msDS-SupportedEncryptionTypes into the directory, so 0x7FFFFFF8 on the machine shows up as 0x18 on the object - that is expected. Scan lists accounts whose msDS-SupportedEncryptionTypes still allows RC4. Note that this is only the member-side policy; since the January 2026 update the KDC side is governed by DefaultDomainSupportedEncTypes, which now defaults to 0x18, and RC4DefaultDisablementPhase stopped being read with the July 2026 updates.'
         })
 
     $s.Add([ordered]@{

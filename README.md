@@ -9,7 +9,7 @@
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE?style=for-the-badge&logo=powershell&logoColor=white)](#prerequisites)
 [![Platform](https://img.shields.io/badge/Windows_Server-2016%2B-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#prerequisites)
 ![Lab tested](https://img.shields.io/badge/lab_tested-Server_2025-2ea44f?style=for-the-badge)
-[![Settings](https://img.shields.io/badge/80_settings-32_topics-6f42c1?style=for-the-badge)](#what-it-deploys)
+[![Settings](https://img.shields.io/badge/82_settings-33_topics-6f42c1?style=for-the-badge)](#what-it-deploys)
 [![License](https://img.shields.io/badge/license-GPLv3-555555?style=for-the-badge)](LICENSE)
 
 <br>
@@ -107,7 +107,7 @@ is what step 2 fixes.
 | --- | --- |
 | `-Apply` | Deploy mode only. Without it nothing is written, but the full plan is produced. |
 | `-Interactive` | Ask before each topic, showing its **current state** on the directory server next to what it would become, with an explanation and a Microsoft article number. |
-| `-Profile Baseline\|Strict` | `Baseline` (60 settings) carries little or no compatibility risk. `Strict` adds 20 that need a maintenance window. |
+| `-Profile Baseline\|Strict` | `Baseline` (62 settings) carries little or no compatibility risk. `Strict` adds 20 that need a maintenance window. |
 | `-Level Audit\|Enforce` | `Audit` deploys staged settings in their observing form. `Enforce` requires them. |
 | `-Area <groups>` | `Signing`, `LegacyAuth`, `CredentialProtection`, `Protocols`, `PolicyIntegrity`, `Logging`, `Services`. |
 | `-MemberServerOu <dn>` | Where to link the member server GPOs. Without it they are created but left unlinked, and the run says so. The DC GPOs link to `OU=Domain Controllers` automatically. |
@@ -119,14 +119,14 @@ is what step 2 fixes.
 
 ## What it deploys
 
-**80 settings in 32 topics, plus 28 advanced audit subcategories.** Every group becomes its own GPO
+**82 settings in 33 topics, plus 28 advanced audit subcategories.** Every group becomes its own GPO
 per role — thirteen small ones rather than two large ones. Names follow `-GpoNamePattern`, so they
 can match your own convention.
 
 | Group | Domain controllers | Member servers | Settings |
 | --- | --- | --- | :-: |
 | **Signing** | `ADHardenKit-DC-Signing` | `ADHardenKit-Member-Signing` | 11 / 9 |
-| **LegacyAuth** | `ADHardenKit-DC-LegacyAuth` | `ADHardenKit-Member-LegacyAuth` | 12 / 10 |
+| **LegacyAuth** | `ADHardenKit-DC-LegacyAuth` | `ADHardenKit-Member-LegacyAuth` | 14 / 11 |
 | **CredentialProtection** | `ADHardenKit-DC-CredentialProtection` | `ADHardenKit-Member-CredentialProtection` | 18 / 20 |
 | **Protocols** | `ADHardenKit-DC-Protocols` | `ADHardenKit-Member-Protocols` | 19 / 20 |
 | **PolicyIntegrity** | `ADHardenKit-DC-PolicyIntegrity` | `ADHardenKit-Member-PolicyIntegrity` | 2 / 2 |
@@ -136,7 +136,7 @@ can match your own convention.
 | Group | What it covers |
 | --- | --- |
 | **Signing** | LDAP server signing, channel binding, client integrity · SMB signing offered and required · Netlogon secure channel |
-| **LegacyAuth** | NTLMv2 only, no LM hash · NTLM session security · NTLM restriction both directions · Kerberos AES only · strong certificate binding for Kerberos **and** Schannel · no plaintext or guest SMB |
+| **LegacyAuth** | NTLMv2 only, no LM hash · NTLM session security · NTLM restriction both directions · Kerberos AES only · **Kerberos armoring (FAST), the prerequisite for Authentication Policies** · strong certificate binding for Kerberos **and** Schannel · no plaintext or guest SMB |
 | **CredentialProtection** | LSA protection · Credential Guard with VBS and HVCI · **RDP with NLA, TLS and no outbound credential delegation** · WDigest, stored and cached credentials · four anonymous restrictions · machine account rotation · `LocalAccountTokenFilterPolicy` |
 | **Protocols** | **TLS 1.0/1.1, RC4 and Triple DES off in Schannel** · LLMNR, NetBIOS **and mDNS** off, NetBIOS also per interface via a GPO startup script · SMBv1 driver **and** the Workstation dependency that goes with it · WinRM without basic, digest or plaintext · **Point and Print restricted to administrators** |
 | **PolicyIntegrity** | UNC hardened paths for SYSVOL and NETLOGON (MS15-011) · forced reapplication, so local drift is corrected within the hour |
@@ -372,7 +372,7 @@ the estate.
 ```
 ADHardenKit.ps1                  the entire tool
 Verify-LoggingDeployment.ps1     post-deployment verification for the Logging group
-README.md · CHANGELOG.md · LICENSE
+README.md · LICENSE
 Logs/ · Reports/                 created on first run
 ```
 
