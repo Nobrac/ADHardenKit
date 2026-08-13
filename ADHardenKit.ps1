@@ -1122,10 +1122,24 @@ function Get-HardenBaseline {
             Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
             RegKey = 'HKLM\Software\Policies\Microsoft\Windows\NetworkProvider\HardenedPaths'
             Values = @(
-                @{ Name = '\\*\SYSVOL'; Type = 'String'; Value = 'RequireMutualAuthentication=1, RequireIntegrity=1' }
-                @{ Name = '\\*\NETLOGON'; Type = 'String'; Value = 'RequireMutualAuthentication=1, RequireIntegrity=1' }
+                @{ Name = '\\*\SYSVOL'; Type = 'String'; Value = 'RequireMutualAuthentication=1, RequireIntegrity=1, RequirePrivacy=1' }
+                @{ Name = '\\*\NETLOGON'; Type = 'String'; Value = 'RequireMutualAuthentication=1, RequireIntegrity=1, RequirePrivacy=1' }
             )
-            Why = 'Group Policy and logon scripts are fetched from these two shares. Without mutual authentication and integrity a machine in the middle can serve modified policy or a modified script to every client that asks. This is the fix for MS15-011 and it is still not on by default.'
+            Why = 'Group Policy and logon scripts are fetched from these two shares. Without mutual authentication and integrity a machine in the middle can serve modified policy or a modified script to every client that asks. This is the fix for MS15-011 and it is still not on by default. RequirePrivacy adds SMB encryption on top, so the policy content is not readable in transit either - a GPO reveals a good deal about how an estate is built.'
+            Observe = 'The first two parameters are what MS15-011 and the CIS benchmark ask for; the third needs Server 2012 or later on both ends, which every system this tool supports is. Anything reading SYSVOL that is not a modern Windows client - a Linux box mounting it, an appliance, a backup agent using SMB - fails after this, and the error will talk about access rather than encryption.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'Gpo-NoCaching'; Topic = 'Policy reapplication'; Group = 'PolicyIntegrity'
+            Name = 'No Group Policy caching'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
+            RegKey = 'HKLM\Software\Policies\Microsoft\Windows\System'
+            Values = @(
+                @{ Name = 'EnableLogonOptimization'; Type = 'DWord'; Value = 0 }
+                @{ Name = 'EnableLogonOptimizationOnServerSKU'; Type = 'DWord'; Value = 0 }
+            )
+            Why = 'With caching on, a synchronous foreground refresh reads the cached copy of the policy rather than fetching the current one. Change a setting, reboot the machine to make it take effect, and the machine applies the version from before the change - the opposite of what was intended, and it looks like the deployment simply did not work. On a server the caching only buys a slightly faster boot, which is not worth an hour of chasing a setting that did apply.'
+            Observe = 'Two value names because the client and server SKUs read different ones; setting both covers either. Pairs with the reapplication setting above - that one makes the security policy reapply every cycle, this one makes sure what gets reapplied is current.'
         })
 
     $s.Add([ordered]@{
