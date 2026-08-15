@@ -226,7 +226,7 @@ param(
 
 # Bumped whenever the baseline or a mechanism changes. Printed on every run and carried into the
 # report, so "which version produced this" is answerable from a pasted log rather than guessed at.
-$script:HardenKitVersion = '1.1.0'
+$script:HardenKitVersion = '1.2.0'
 
 $ErrorActionPreference = 'Stop'
 
@@ -408,6 +408,40 @@ function Test-HardenPrerequisite {
         $checks.Add([pscustomobject]@{ Name = 'Directory connectivity'; Pass = $true; Detail = "Connected to $($ctx.Server)" })
         $sysvol = Test-Path -LiteralPath $ctx.SysvolPolicyPath
         $checks.Add([pscustomobject]@{ Name = 'SYSVOL access'; Pass = $sysvol; Detail = $ctx.SysvolPolicyPath })
+
+        # Functional level and schema, because a registry value is not the only thing a setting
+        # can depend on. Almost everything here is delivered as policy and works at any level,
+        # but Kerberos armoring is negotiated by the directory: below domain functional level
+        # 2012 the KDC accepts the setting and behaves as though it were Supported, whichever
+        # level is configured. Reported rather than enforced - a domain that cannot raise its
+        # level still benefits from the other ninety settings.
+        $ad = Get-HardenAdParameter
+        $domain = Get-ADDomain @ad -ErrorAction Stop
+        $forest = Get-ADForest @ad -ErrorAction SilentlyContinue
+
+        $schema = 'unknown'
+        try {
+            $sv = (Get-ADObject -Identity "CN=Schema,CN=Configuration,$($domain.DistinguishedName -replace '^.*?(DC=.*)$', '$1')" -Properties objectVersion @ad -ErrorAction Stop).objectVersion
+            $schema = switch ([int]$sv) {
+                87 { "$sv (Server 2016)" }
+                88 { "$sv (Server 2019 or 2022)" }
+                90 { "$sv (Server 2025)" }
+                default { "$sv" }
+            }
+        }
+        catch { }
+
+        $levelText = "Domain $($domain.DomainMode), forest $(if ($forest) { $forest.ForestMode } else { 'unknown' }), schema $schema"
+
+        # Everything from Windows2012Domain upward sorts after Windows2008R2Domain as a string,
+        # which is not something to rely on - match the known older names instead.
+        $preArmoring = "$($domain.DomainMode)" -in 'Windows2000Domain', 'Windows2003Domain', 'Windows2008Domain', 'Windows2008R2Domain'
+        $checks.Add([pscustomobject]@{
+                Name = 'Functional level'
+                Pass = $true
+                Detail = if ($preArmoring) { "$levelText - below 2012, so Kerberos armoring will deploy but stay at Supported whatever level is set" }
+                else { $levelText }
+            })
     }
     catch {
         $checks.Add([pscustomobject]@{ Name = 'Directory connectivity'; Pass = $false; Detail = $_.Exception.Message })
@@ -459,6 +493,10 @@ function Get-HardenBaseline {
         Reference   Microsoft article, advisory or CVE number to search for. Numbers only and no
                     links, because links rot and a number can be pasted into any search box years
                     from now.
+        MinOS       the oldest Windows version that reads this value. Older systems accept the
+                    policy, apply it, and ignore it - no error anywhere, which is the failure mode
+                    this tool exists to catch rather than produce. Stated so the card and the
+                    report can say it out loud.
         NeedsReboot the value is written immediately but the component only reads it at startup,
                     so the setting is not in force until the machine restarts. Worth stating,
                     because verifying such a setting on the running system shows the old value and
@@ -495,6 +533,41 @@ function Get-HardenBaseline {
         })
 
     $s.Add([ordered]@{
+            Id = 'SMB-AuditServerSigning'; MinOS = 'Server 2008 R2'; Topic = 'SMB audit'; Group = 'Signing'
+            Name = 'Log clients that connect without signing'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
+            RegKey = 'HKLM\Software\Policies\Microsoft\Windows\LanmanServer'
+            Values = @(
+                @{ Name = 'AuditClientDoesNotSupportSigning'; Type = 'DWord'; Value = 1 }
+                @{ Name = 'AuditClientDoesNotSupportEncryption'; Type = 'DWord'; Value = 1 }
+            )
+            Why = 'This is the missing half of the SMB signing story. Requiring signing is the setting that can take a NAS or an appliance off the network, and until now the only way to find out in advance was a manual Set-SmbServerConfiguration on every server. There is a policy for it, and it belongs in the same GPO as the thing it observes: every client that connects to this machine without signing is written to SMBServer/Audit as event 3000, by name.'
+            Observe = 'Records only, refuses nothing - safe to deploy anywhere at any time, and the right first step before the required-signing settings in this group. The encryption half needs Server 2025 or Windows 11 and is ignored on older builds; the signing half works back to Server 2008 R2.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'SMB-AuditClientSigning'; MinOS = 'Server 2025'; Topic = 'SMB audit'; Group = 'Signing'
+            Name = 'Log servers reached that cannot sign'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
+            RegKey = 'HKLM\Software\Policies\Microsoft\Windows\LanmanWorkstation'
+            Values = @(
+                @{ Name = 'AuditServerDoesNotSupportSigning'; Type = 'DWord'; Value = 1 }
+                @{ Name = 'AuditServerDoesNotSupportEncryption'; Type = 'DWord'; Value = 1 }
+            )
+            Why = 'The outbound direction. Every server this machine connected to that could not sign lands in SMBClient/Connectivity as event 31998 - which is how a backup job pointed at an old appliance is found before, rather than after, client signing is required.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'SMB-AuditGuest'; MinOS = 'Server 2025'; Topic = 'SMB audit'; Group = 'Signing'
+            Name = 'Log insecure guest logons'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
+            RegKey = 'HKLM\Software\Policies\Microsoft\Windows\LanmanWorkstation'
+            Values = @(@{ Name = 'AuditInsecureGuestLogon'; Type = 'DWord'; Value = 1 })
+            Why = 'Guest access to SMB is unauthenticated and unsigned, so anything relying on it can be redirected. The guest fallback is already refused elsewhere in this baseline; this records who was still trying, which is the list of shares that need fixing rather than blaming.'
+            Observe = 'Server 2025 and Windows 11 only.'
+        })
+
+    $s.Add([ordered]@{
             Id = 'SMB-ServerSigningRequired'; Topic = 'SMB signing'; Group = 'Signing'; Name = 'SMB server requires signing'
             Type = 'SecurityOption'; Target = 'Both'; Profile = 'Baseline'; Staged = $true
             Key = 'MACHINE\System\CurrentControlSet\Services\LanManServer\Parameters\RequireSecuritySignature'
@@ -505,7 +578,7 @@ function Get-HardenBaseline {
             # Level Audit; the observation happens in the SMBServer audit log instead.
             ValueType = 4; AuditValue = $null; EnforceValue = 1
             Why = 'Without server-side signing an SMB session can be relayed. Domain controllers require it by default; member servers usually do not.'
-            Observe = 'Turn on SMB signing auditing first - Set-SmbServerConfiguration -AuditClientDoesNotSupportSigning $true - and read the SMBServer/Audit log. Old NAS devices and appliances are the usual casualties.'
+            Observe = 'The observation form is a separate policy, deployed by the SMB audit topic in this same group: it logs every client that connected without signing, to SMBServer/Audit event 3000. Deploy that, read the log for a cycle, then come back here. Old NAS devices and appliances are the usual casualties.'
         })
 
     $s.Add([ordered]@{
@@ -515,7 +588,7 @@ function Get-HardenBaseline {
             # Same reasoning as the server side: absent rather than zero.
             ValueType = 4; AuditValue = $null; EnforceValue = 1
             Why = 'Stops the server from talking to a file server that will not sign - which is also how it breaks a backup job pointed at an old appliance.'
-            Observe = 'SMBClient/Connectivity log. Set-SmbClientConfiguration -AuditServerDoesNotSupportSigning $true turns on the matching audit events.'
+            Observe = 'The observation form is a separate policy, deployed by the SMB audit topic in this same group - it records every server this machine reached that could not sign, to SMBClient/Connectivity event 31998. A backup job pointed at an old appliance is the classic find.'
         })
 
     $s.Add([ordered]@{
@@ -580,7 +653,7 @@ function Get-HardenBaseline {
         })
 
     $s.Add([ordered]@{
-            Id = 'Kerberos-ArmoringKdc'; Topic = 'Kerberos armoring'; Group = 'LegacyAuth'
+            Id = 'Kerberos-ArmoringKdc'; MinOS = 'Server 2012'; Topic = 'Kerberos armoring'; Group = 'LegacyAuth'
             Name = 'KDC advertises claims and armoring'
             Type = 'AdminTemplate'; Target = 'DC'; Profile = 'Baseline'; Staged = $false
             RegKey = 'HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\System\KDC\Parameters'
@@ -593,7 +666,7 @@ function Get-HardenBaseline {
         })
 
     $s.Add([ordered]@{
-            Id = 'Kerberos-ArmoringClient'; Topic = 'Kerberos armoring'; Group = 'LegacyAuth'
+            Id = 'Kerberos-ArmoringClient'; MinOS = 'Server 2012'; Topic = 'Kerberos armoring'; Group = 'LegacyAuth'
             Name = 'Kerberos client supports claims and armoring'
             Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
             RegKey = 'HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters'
@@ -674,7 +747,7 @@ function Get-HardenBaseline {
 
     # -- Administrative templates (registry policy) ---------------------------------------------
     $s.Add([ordered]@{
-            Id = 'CredentialGuard'; Topic = 'Credential Guard and VBS'; NeedsReboot = $true; Group = 'CredentialProtection'; Name = 'Credential Guard with VBS'
+            Id = 'CredentialGuard'; MinOS = 'Server 2016'; Topic = 'Credential Guard and VBS'; NeedsReboot = $true; Group = 'CredentialProtection'; Name = 'Credential Guard with VBS'
             Type = 'AdminTemplate'; Target = 'Member'; Profile = 'Baseline'; Staged = $false
             RegKey = 'HKLM\Software\Policies\Microsoft\Windows\DeviceGuard'
             Values = @(
@@ -752,6 +825,57 @@ function Get-HardenBaseline {
             Values = @(@{ Name = 'MaxSize'; Type = 'DWord'; Value = 268435456 })
             Why = 'Script block logging fills the default 15 MB PowerShell log in hours on a server that runs any automation at all, and event 4104 is the one record an investigation actually wants. 256 MB is a reasonable floor.'
             Observe = 'Two things differ from the security log setting above and both are easy to get wrong. The Policies\...\EventLog\<name> branch only backs the four logs that have an ADMX behind them - Application, Security, Setup, System - so a channel under Applications and Services Logs has to be addressed at its WINEVT\Channels key instead. And MaxSize there is in bytes, not kilobytes, so the number is a thousand times larger for the same size. Because this key sits outside Policies it tattoos: unlinking the GPO leaves the value behind, and reverting means setting it back explicitly.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'SMB-MinDialectServer'; MinOS = 'Server 2022'; Topic = 'SMB dialect'; Group = 'Protocols'
+            Name = 'Server refuses anything below SMB 3.0'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Strict'; Staged = $false
+            RegKey = 'HKLM\Software\Policies\Microsoft\Windows\LanmanServer'
+            Values = @(@{ Name = 'MinSmb2Dialect'; Type = 'DWord'; Value = 768 })
+            Why = 'Disabling the SMBv1 driver elsewhere in this baseline stops the worst dialect. This sets a floor under the rest: 768 is 0x300, SMB 3.0.0, the first dialect with encryption and a signed negotiation that cannot be downgraded. SMB 2.0.2 and 2.1 negotiate happily and offer neither.'
+            Observe = 'Windows 7 and Server 2008 R2 speak SMB 2.1 and stop reaching this machine after it. So do a number of NAS firmwares and older Linux Samba builds. Deploy the SMB audit topic first and read what actually connects - this is Strict for a reason.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'SMB-MinDialectClient'; MinOS = 'Server 2022'; Topic = 'SMB dialect'; Group = 'Protocols'
+            Name = 'Client refuses anything below SMB 3.0'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Strict'; Staged = $false
+            RegKey = 'HKLM\Software\Policies\Microsoft\Windows\LanmanWorkstation'
+            Values = @(@{ Name = 'MinSmb2Dialect'; Type = 'DWord'; Value = 768 })
+            Why = 'The outbound half - this machine will not connect to a file server that cannot speak SMB 3.0 either.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'SMB-RateLimiter'; MinOS = 'Server 2025'; Topic = 'SMB brute force protection'; Group = 'Protocols'
+            Name = 'Delay after a failed SMB authentication'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
+            RegKey = 'HKLM\Software\Policies\Microsoft\Windows\LanmanServer'
+            Values = @(
+                @{ Name = 'EnableAuthRateLimiter'; Type = 'DWord'; Value = 1 }
+                @{ Name = 'InvalidAuthenticationDelayTimeInMs'; Type = 'DWord'; Value = 2000 }
+            )
+            Why = 'Two seconds after every failed SMB logon. That turns password spraying over SMB from thousands of attempts per minute into a handful, which is the difference between a weak password being found and not. On by default in Server 2025; stating it explicitly pins the delay and catches a machine where someone turned it off to speed up a migration.'
+            Observe = 'Server 2025 and Windows 11 only. Harmless to a legitimate client, which does not fail authentication repeatedly - but a service account with a stale password in a loop will now retry more slowly, and that shows up as slowness rather than as an error.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'SMB-NoMailslotsServer'; MinOS = 'Server 2025'; Topic = 'Legacy SMB discovery'; Group = 'Protocols'
+            Name = 'Browser service without remote mailslots'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
+            RegKey = 'HKLM\Software\Policies\Microsoft\Windows\Bowser'
+            Values = @(@{ Name = 'EnableMailslots'; Type = 'DWord'; Value = 0 })
+            Why = 'Remote mailslots are an unauthenticated, unsigned datagram mechanism from the original browser protocol, still reachable over SMB. Nothing written this century needs them, and they belong to the same family as the name resolution protocols this baseline already switches off.'
+            Observe = 'Server 2025 and Windows 11 only. Anything relying on the legacy Computer Browser service - a NET VIEW listing, some very old backup software - loses it.'
+        })
+
+    $s.Add([ordered]@{
+            Id = 'SMB-NoMailslotsClient'; MinOS = 'Server 2025'; Topic = 'Legacy SMB discovery'; Group = 'Protocols'
+            Name = 'Network provider without remote mailslots'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
+            RegKey = 'HKLM\Software\Policies\Microsoft\Windows\NetworkProvider'
+            Values = @(@{ Name = 'EnableMailslots'; Type = 'DWord'; Value = 0 })
+            Why = 'The client half of the same thing.'
         })
 
     $s.Add([ordered]@{
@@ -885,6 +1009,17 @@ function Get-HardenBaseline {
         })
 
     # -- Remote Desktop -------------------------------------------------------------------------
+    $s.Add([ordered]@{
+            Id = 'CredSsp-EncryptionOracle'; Topic = 'Remote Desktop'; Group = 'CredentialProtection'
+            Reference = 'CVE-2018-0886, KB4093492'
+            Name = 'CredSSP refuses unpatched peers'
+            Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
+            RegKey = 'HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\System\CredSSP\Parameters'
+            Values = @(@{ Name = 'AllowEncryptionOracle'; Type = 'DWord'; Value = 0 })
+            Why = 'CVE-2018-0886 let an attacker in the middle of a CredSSP exchange relay the session and run code with the credentials being delegated - which for RDP means the credentials of whoever was connecting. Value 0, Force Updated Clients, refuses any peer that has not been patched. The vulnerability is from 2018 and the patch is long since installed everywhere; what is often missing is this setting, which is what makes the machine actually refuse the vulnerable path.'
+            Observe = 'A client or server that genuinely has not been patched since 2018 can no longer connect over RDP. If something breaks, the answer is to patch it, not to lower this.'
+        })
+
     $s.Add([ordered]@{
             Id = 'Rdp-SecureTransport'; Topic = 'Remote Desktop'; Group = 'CredentialProtection'
             Name = 'RDP requires NLA, TLS and high encryption'
@@ -1155,7 +1290,7 @@ function Get-HardenBaseline {
         })
 
     $s.Add([ordered]@{
-            Id = 'NetBIOS-Disabled'; Topic = 'Name resolution poisoning'; Group = 'Protocols'; Name = 'NetBIOS over TCP/IP off'
+            Id = 'NetBIOS-Disabled'; MinOS = 'Server 2025'; Topic = 'Name resolution poisoning'; Group = 'Protocols'; Name = 'NetBIOS over TCP/IP off'
             Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
             RegKey = 'HKLM\Software\Policies\Microsoft\Windows NT\DNSClient'
             Values = @(@{ Name = 'EnableNetbios'; Type = 'DWord'; Value = 0 })
@@ -1164,7 +1299,7 @@ function Get-HardenBaseline {
         })
 
     $s.Add([ordered]@{
-            Id = 'mDNS-Disabled'; NeedsReboot = $true; Topic = 'Name resolution poisoning'; Group = 'Protocols'
+            Id = 'mDNS-Disabled'; MinOS = 'Server 2019'; NeedsReboot = $true; Topic = 'Name resolution poisoning'; Group = 'Protocols'
             Name = 'mDNS off'
             Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
             RegKey = 'HKLM\System\CurrentControlSet\Services\Dnscache\Parameters'
@@ -1243,7 +1378,7 @@ foreach ($iface in (Get-ChildItem -LiteralPath $key -ErrorAction SilentlyContinu
         })
 
     $s.Add([ordered]@{
-            Id = 'VBS-CodeIntegrity'; Topic = 'Credential Guard and VBS'; NeedsReboot = $true; Group = 'CredentialProtection'; Name = 'Hypervisor enforced code integrity'
+            Id = 'VBS-CodeIntegrity'; MinOS = 'Server 2016'; Topic = 'Credential Guard and VBS'; NeedsReboot = $true; Group = 'CredentialProtection'; Name = 'Hypervisor enforced code integrity'
             Type = 'AdminTemplate'; Target = 'Member'; Profile = 'Strict'; Staged = $false
             RegKey = 'HKLM\Software\Policies\Microsoft\Windows\DeviceGuard'
             Values = @(
@@ -1628,8 +1763,25 @@ function Request-HardenTopicDecision {
             $changeCount++
             Write-Host ("{0,-$currentWidth} " -f $row.Current) -ForegroundColor White -NoNewline
             Write-Host '-> ' -ForegroundColor DarkGray -NoNewline
-            Write-Host $row.Target -ForegroundColor Cyan
+            Write-Host $row.Target -ForegroundColor Cyan -NoNewline
+            # An der Zeile, nicht im Fliesstext: eine Einstellung, die auf dieser Maschine gar
+            # nicht gelesen wird, sieht sonst aus wie jede andere Aenderung.
+            if ($row.Item.MinOS) { Write-Host "  [$($row.Item.MinOS)+]" -ForegroundColor DarkYellow } else { Write-Host '' }
         }
+    }
+
+    # Eine Zeile pro Thema statt pro Einstellung: bei fuenf SMB-Werten mit derselben
+    # Mindestversion ist die Wiederholung Laerm, die Aussage aber wichtig.
+    # Sorted by release, not alphabetically, and only the highest requirement is named: a topic
+    # where one setting needs 2008 R2 and another needs 2025 is a 2025 topic for anyone deciding
+    # whether it will do anything, and listing both reads as a choice between them.
+    $osRank = @{ 'Server 2008 R2' = 1; 'Server 2012' = 2; 'Server 2016' = 3; 'Server 2019' = 4; 'Server 2022' = 5; 'Server 2025' = 6 }
+    $osItems = @($deployedItems | Where-Object { $_.MinOS })
+    if ($osItems.Count -gt 0) {
+        $highest = ($osItems | Sort-Object { $osRank[[string]$_.MinOS] } -Descending | Select-Object -First 1).MinOS
+        $atHighest = @($osItems | Where-Object { $_.MinOS -eq $highest }).Count
+        Write-Host ''
+        Write-Host ("       $atHighest of these need $highest or later. An older machine takes the policy, applies it and ignores it - nothing fails, nothing happens.") -ForegroundColor DarkYellow
     }
 
     $untouched = $rows.Count - $alreadyCount - $changeCount
@@ -3465,6 +3617,13 @@ function Confirm-HardenApply {
 
     if ($reboot.Count -gt 0) {
         Write-Host ("    Reboot    {0} setting(s) only take effect after a restart" -f $reboot.Count) -ForegroundColor DarkYellow
+    }
+    # Group-Object MinOS on an OrderedDictionary groups on a property that does not exist and
+    # returns one empty-named group; the script block form reads the key.
+    $osLimited = @($inScope | Where-Object { $_.MinOS })
+    if ($osLimited.Count -gt 0) {
+        $byOs = $osLimited | Group-Object { $_.MinOS } | Sort-Object Name | ForEach-Object { "$($_.Count) need $($_.Name)+" }
+        Write-Host ("    Versions  {0} - older machines apply these and ignore them" -f ($byOs -join ', ')) -ForegroundColor DarkYellow
     }
     if ($scripts.Count -gt 0) {
         Write-Host ("    Scripts   {0} setting(s) deploy as a GPO startup script and need two restarts to take hold" -f $scripts.Count) -ForegroundColor DarkYellow

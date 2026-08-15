@@ -9,7 +9,7 @@
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE?style=for-the-badge&logo=powershell&logoColor=white)](#prerequisites)
 [![Platform](https://img.shields.io/badge/Windows_Server-2016%2B-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#prerequisites)
 ![Lab tested](https://img.shields.io/badge/lab_tested-Server_2025-2ea44f?style=for-the-badge)
-[![Settings](https://img.shields.io/badge/83_settings-33_topics-6f42c1?style=for-the-badge)](#what-it-deploys)
+[![Settings](https://img.shields.io/badge/92_settings-37_topics-6f42c1?style=for-the-badge)](#what-it-deploys)
 [![License](https://img.shields.io/badge/license-GPLv3-555555?style=for-the-badge)](LICENSE)
 
 <br>
@@ -107,7 +107,7 @@ is what step 2 fixes.
 | --- | --- |
 | `-Apply` | Deploy mode only. Without it nothing is written, but the full plan is produced. |
 | `-Interactive` | Ask before each topic, showing its **current state** on the directory server next to what it would become, with an explanation and a Microsoft article number. |
-| `-Profile Baseline\|Strict` | `Baseline` (63 settings) carries little or no compatibility risk. `Strict` adds 20 that need a maintenance window. |
+| `-Profile Baseline\|Strict` | `Baseline` (70 settings) carries little or no compatibility risk. `Strict` adds 22 that need a maintenance window. |
 | `-Level Audit\|Enforce` | `Audit` deploys staged settings in their observing form. `Enforce` requires them. |
 | `-Area <groups>` | `Signing`, `LegacyAuth`, `CredentialProtection`, `Protocols`, `PolicyIntegrity`, `Logging`, `Services`. |
 | `-MemberServerOu <dn>` | Where to link the member server GPOs. Without it they are created but left unlinked, and the run says so. The DC GPOs link to `OU=Domain Controllers` automatically. |
@@ -119,26 +119,26 @@ is what step 2 fixes.
 
 ## What it deploys
 
-**83 settings in 33 topics, plus 28 advanced audit subcategories.** Every group becomes its own GPO
+**92 settings in 37 topics, plus 28 advanced audit subcategories.** Every group becomes its own GPO
 per role — thirteen small ones rather than two large ones. Names follow `-GpoNamePattern`, so they
 can match your own convention.
 
 | Group | Domain controllers | Member servers | Settings |
 | --- | --- | --- | :-: |
-| **Signing** | `ADHardenKit-DC-Signing` | `ADHardenKit-Member-Signing` | 11 / 9 |
+| **Signing** | `ADHardenKit-DC-Signing` | `ADHardenKit-Member-Signing` | 14 / 12 |
 | **LegacyAuth** | `ADHardenKit-DC-LegacyAuth` | `ADHardenKit-Member-LegacyAuth` | 14 / 11 |
-| **CredentialProtection** | `ADHardenKit-DC-CredentialProtection` | `ADHardenKit-Member-CredentialProtection` | 18 / 20 |
-| **Protocols** | `ADHardenKit-DC-Protocols` | `ADHardenKit-Member-Protocols` | 19 / 20 |
+| **CredentialProtection** | `ADHardenKit-DC-CredentialProtection` | `ADHardenKit-Member-CredentialProtection` | 19 / 21 |
+| **Protocols** | `ADHardenKit-DC-Protocols` | `ADHardenKit-Member-Protocols` | 24 / 26 |
 | **PolicyIntegrity** | `ADHardenKit-DC-PolicyIntegrity` | `ADHardenKit-Member-PolicyIntegrity` | 3 / 3 |
 | **Logging** | `ADHardenKit-DC-Logging` | `ADHardenKit-Member-Logging` | 13 / 10 |
 | **Services** | `ADHardenKit-DC-Services` | — none, no setting applies | 1 / — |
 
 | Group | What it covers |
 | --- | --- |
-| **Signing** | LDAP server signing, channel binding, client integrity · SMB signing offered and required · Netlogon secure channel |
+| **Signing** | LDAP server signing, channel binding, client integrity · SMB signing offered and required, **with the audit policy that finds what would break first** · Netlogon secure channel |
 | **LegacyAuth** | NTLMv2 only, no LM hash · NTLM session security · NTLM restriction both directions · Kerberos AES only · **Kerberos armoring (FAST), the prerequisite for Authentication Policies** · strong certificate binding for Kerberos **and** Schannel · no plaintext or guest SMB |
 | **CredentialProtection** | LSA protection · Credential Guard with VBS and HVCI · **RDP with NLA, TLS and no outbound credential delegation** · WDigest, stored and cached credentials · four anonymous restrictions · machine account rotation · `LocalAccountTokenFilterPolicy` |
-| **Protocols** | **TLS 1.0/1.1, RC4 and Triple DES off in Schannel** · LLMNR, NetBIOS **and mDNS** off, NetBIOS also per interface via a GPO startup script · SMBv1 driver **and** the Workstation dependency that goes with it · WinRM without basic, digest or plaintext · **Point and Print restricted to administrators** |
+| **Protocols** | **TLS 1.0/1.1, RC4 and Triple DES off in Schannel** · LLMNR, NetBIOS **and mDNS** off, NetBIOS also per interface via a GPO startup script · SMBv1 driver **and** the Workstation dependency that goes with it · WinRM without basic, digest or plaintext · **SMB 3.0 minimum dialect, authentication rate limiter, no remote mailslots** · **Point and Print restricted to administrators** |
 | **PolicyIntegrity** | UNC hardened paths for SYSVOL and NETLOGON with SMB encryption (MS15-011) · forced reapplication of the security policy · no Group Policy caching, so a reboot applies the current policy and not the cached one |
 | **Logging** | 28 audit subcategories · PowerShell logging · command line in event 4688 · NTLM auditing · LDAP interface diagnostics · log sizes · `SCENoApplyLegacyAuditPolicy` |
 | **Services** | Print Spooler disabled on domain controllers |
@@ -157,6 +157,38 @@ says so.
 
 Audit subcategories are addressed by **GUID, not name** — names are localised, and a policy written
 by name silently applies to nothing on a German or French system.
+
+---
+
+## What runs where
+
+The baseline targets Server 2016 and later, but a handful of settings were introduced with newer
+builds. An older machine accepts the policy, applies it, and **ignores it** — no error anywhere,
+which is exactly the kind of silent non-effect the rest of this tool exists to surface. So it is
+surfaced: every affected setting carries its minimum version, the interactive card marks the row
+`[Server 2025+]`, and the confirmation prompt counts them before anything is written.
+
+| Minimum | Settings | What they are |
+|---|:-:|---|
+| Server 2008 R2 | 1 | SMB signing audit, server side |
+| Server 2012 | 2 | Kerberos armoring, KDC and client |
+| Server 2016 | 2 | Credential Guard, HVCI — also need virtualisation and Secure Boot |
+| Server 2019 | 1 | mDNS off |
+| Server 2022 | 2 | SMB 3.0 minimum dialect |
+| Server 2025 | 6 | SMB encryption and guest audit, authentication rate limiter, remote mailslots, NetBIOS policy |
+| no constraint | 78 | everything else |
+
+In practice: on **Server 2022**, 6 of 92 settings do nothing. On **Server 2019**, 8. Nothing breaks
+either way, and the remainder — signing, NTLM, Kerberos, LSA protection, auditing — is the part
+that matters most and works everywhere.
+
+**Functional level and schema are a separate axis.** Almost everything here is delivered as policy
+and applies at any level. The exception is Kerberos armoring, which the directory negotiates:
+below domain functional level 2012 the KDC accepts the setting and behaves as though it were
+*Supported* whatever level is configured. The prerequisite check reports the domain and forest
+level and the schema version on every run, and says so when the level is too old — it does not
+refuse to run, because a domain that cannot raise its level still benefits from the other ninety
+settings. No schema extension is needed for anything in this tool.
 
 ---
 
@@ -230,7 +262,7 @@ running with.
 | PowerShell | 5.1 or 7.x with the `ActiveDirectory` and `GroupPolicy` modules (RSAT). |
 | Privileges | Elevated, permission to create and link GPOs, write access to `\\<domain>\SYSVOL\<domain>\Policies`. |
 | Host | A domain controller or a management host with RSAT. The scan reads from the DCs over **WinRM**. |
-| Windows | Server 2016+. Credential Guard and HVCI need virtualisation and Secure Boot. The NetBIOS policy exists only on Windows 11 22H2 / Server 2025 and later. |
+| Windows | Server 2016 and later. See [what runs where](#what-runs-where) — a few settings need a newer build and are marked. |
 
 ```powershell
 .\ADHardenKit.ps1 -Mode Check
