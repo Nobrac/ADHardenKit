@@ -30,7 +30,7 @@
         ADHardenKit-DC-CredentialProtection     ADHardenKit-Member-CredentialProtection
         ADHardenKit-DC-Protocols                ADHardenKit-Member-Protocols
         ADHardenKit-DC-Logging                  ADHardenKit-Member-Logging
-        ADHardenKit-DC-Services
+        ADHardenKit-DC-Services                 ADHardenKit-Member-Services
         ADHardenKit-DC-LOLBins                  ADHardenKit-Member-LOLBins
 
     That is deliberate. When SMB signing turns out to have been holding up a NAS, you unlink one
@@ -236,7 +236,7 @@ param(
 
 # Bumped whenever the baseline or a mechanism changes. Printed on every run and carried into the
 # report, so "which version produced this" is answerable from a pasted log rather than guessed at.
-$script:HardenKitVersion = '1.3.0'
+$script:HardenKitVersion = '1.3.1'
 
 $ErrorActionPreference = 'Stop'
 
@@ -1106,6 +1106,15 @@ function Get-HardenBaseline {
             Observe = 'Only breaks things if someone genuinely prints from a DC, which they should not.'
         })
 
+    $s.Add([ordered]@{
+            Id = 'Service-WebClient'; Topic = 'WebDAV redirector'; Reference = 'ADV210003, CVE-2021-36942'; Group = 'Services'
+            Name = 'WebClient service disabled'
+            Type = 'Service'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
+            ServiceName = 'WebClient'; StartupMode = 4
+            Why = 'The WebDAV redirector turns a UNC path into an HTTP request, and an HTTP authentication can be relayed to LDAP or to AD CS. SMB signing does nothing about that - this is the path that goes around the Signing group rather than through it, which is why a tool that requires signing everywhere and leaves this service running has a hole in the middle of its own argument. Coercion techniques reach for it precisely because it drops the signing problem.'
+            Observe = 'On Windows Server the service belongs to the WebDAV Redirector feature and is not installed by default, so on most servers this pins a state that already holds and there is nothing to break. Where the feature was added deliberately, this takes it away: anything mapping a drive to a WebDAV or SharePoint share stops working, and the error names the drive rather than the service. Check that before deploying to a machine that syncs documents. Writing the entry on a machine without the service is the point rather than a side effect - it holds if someone installs the feature later.'
+        })
+
     # -- Additions after reading HardenAD's shipped policy templates ---------------------------
     # Their GPO backups set a number of things this baseline had missed. These are the ones worth
     # having; the rest were workstation concerns or risk without much return.
@@ -1780,7 +1789,10 @@ function Get-HardenLiveValue {
                 $svc = Invoke-Command -ComputerName $ctx.Server -ArgumentList $Item.ServiceName -ScriptBlock {
                     param($n) Get-Service -Name $n -ErrorAction SilentlyContinue
                 } -ErrorAction Stop
-                if ($svc) { $result = "$($svc.StartType), $($svc.Status)" }
+                # A reachable machine that simply does not have the service is not the same as a
+                # machine that could not be asked. WebClient is absent on a default Server install,
+                # and reporting that as "unknown" reads like a failure rather than the answer.
+                $result = if ($svc) { "$($svc.StartType), $($svc.Status)" } else { 'not installed' }
             }
             catch { }
             $script:LiveCache[$key] = $result

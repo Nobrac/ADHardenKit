@@ -9,7 +9,7 @@
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE?style=for-the-badge&logo=powershell&logoColor=white)](#prerequisites)
 [![Platform](https://img.shields.io/badge/Windows_Server-2016%2B-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#prerequisites)
 ![Lab tested](https://img.shields.io/badge/lab_tested-Server_2025-2ea44f?style=for-the-badge)
-[![Settings](https://img.shields.io/badge/92_settings-37_topics-6f42c1?style=for-the-badge)](#what-it-deploys)
+[![Settings](https://img.shields.io/badge/93_settings-38_topics-6f42c1?style=for-the-badge)](#what-it-deploys)
 [![License](https://img.shields.io/badge/license-GPLv3-555555?style=for-the-badge)](LICENSE)
 
 <br>
@@ -119,8 +119,8 @@ is what step 2 fixes.
 
 ## What it deploys
 
-**92 settings in 37 topics, plus 28 advanced audit subcategories and 50 LOLBin firewall rules in 6
-topics.** Every group becomes its own GPO per role — fifteen small ones rather than two large ones. Names follow `-GpoNamePattern`, so they
+**93 settings in 38 topics, plus 28 advanced audit subcategories and 50 LOLBin firewall rules in 6
+topics.** Every group becomes its own GPO per role — sixteen small ones rather than two large ones. Names follow `-GpoNamePattern`, so they
 can match your own convention.
 
 | Group | Domain controllers | Member servers | Settings |
@@ -131,7 +131,7 @@ can match your own convention.
 | **Protocols** | `ADHardenKit-DC-Protocols` | `ADHardenKit-Member-Protocols` | 24 / 26 |
 | **PolicyIntegrity** | `ADHardenKit-DC-PolicyIntegrity` | `ADHardenKit-Member-PolicyIntegrity` | 3 / 3 |
 | **Logging** | `ADHardenKit-DC-Logging` | `ADHardenKit-Member-Logging` | 13 / 10 |
-| **Services** | `ADHardenKit-DC-Services` | — none, no setting applies | 1 / — |
+| **Services** | `ADHardenKit-DC-Services` | `ADHardenKit-Member-Services` | 2 / 1 |
 | **LOLBins** *(opt-in)* | `ADHardenKit-DC-LOLBins` | `ADHardenKit-Member-LOLBins` | 12 / 50 |
 
 | Group | What it covers |
@@ -142,7 +142,7 @@ can match your own convention.
 | **Protocols** | **TLS 1.0/1.1, RC4 and Triple DES off in Schannel** · LLMNR, NetBIOS **and mDNS** off, NetBIOS also per interface via a GPO startup script · SMBv1 driver **and** the Workstation dependency that goes with it · WinRM without basic, digest or plaintext · **SMB 3.0 minimum dialect, authentication rate limiter, no remote mailslots** · **Point and Print restricted to administrators** |
 | **PolicyIntegrity** | UNC hardened paths for SYSVOL and NETLOGON with SMB encryption (MS15-011) · forced reapplication of the security policy · no Group Policy caching, so a reboot applies the current policy and not the cached one |
 | **Logging** | 28 audit subcategories · PowerShell logging · command line in event 4688 · NTLM auditing · LDAP interface diagnostics · log sizes · `SCENoApplyLegacyAuditPolicy` |
-| **Services** | Print Spooler disabled on domain controllers |
+| **Services** | Print Spooler disabled on domain controllers · **WebClient (WebDAV redirector) disabled everywhere** — the HTTP relay path that SMB signing cannot cover |
 | **LOLBins** *(opt-in)* | Outbound network access blocked for the binaries used as download cradles and C2 channels — certutil, mshta, bitsadmin, regsvr32, rundll32, the script hosts, the .NET proxies — as **firewall rules inside the GPO**, so unlinking removes them again |
 
 The split is deliberate. When SMB signing turns out to have been holding up a NAS, you unlink the
@@ -151,7 +151,8 @@ or nothing, and under pressure people pick nothing.
 
 Domain controllers and member servers get separate GPOs because the roles need different settings —
 Credential Guard, for one, adds no security on a domain controller. A group with nothing applicable
-to a role produces **no GPO at all**, which is why there is no `ADHardenKit-Member-Services`.
+to a role produces **no GPO at all**; before 1.3.1 that was the case for `ADHardenKit-Member-Services`,
+which now exists because the WebClient setting applies to member servers too.
 
 The **DC GPOs link to `OU=Domain Controllers` automatically**; the member GPOs need
 `-MemberServerOu`. Without it they are created and fully populated but left unlinked, and the run
@@ -227,14 +228,11 @@ Set-SmbClientConfiguration -AuditServerDoesNotSupportSigning $true
 
 ## LOLBins — the opt-in group
 
+Check the firewall is actually on, write the rules switched off, then switch them on:
+
 ```powershell
-# Is the Windows Firewall even on? (Nothing else is read for this group.)
-.\ADHardenKit.ps1 -Mode Scan -Area LOLBins -NoMenu
-
-# Write the rules, switched off, so they can be reviewed in the GPMC
+.\ADHardenKit.ps1 -Mode Scan   -Area LOLBins -NoMenu
 .\ADHardenKit.ps1 -Mode Deploy -Area LOLBins -MemberServerOu 'OU=Server,DC=example,DC=com' -Apply
-
-# Switch them on
 .\ADHardenKit.ps1 -Mode Deploy -Area LOLBins -Level Enforce -MemberServerOu 'OU=Server,DC=example,DC=com' -Apply
 ```
 
@@ -407,7 +405,7 @@ and the result is less convenient than "unlink and you're done":
 | --- | --- | :-: |
 | `registry.pol` under a `\Policies\` branch | **removed at the next refresh** | 22 |
 | `registry.pol` outside those branches | stays | 18 |
-| Security template (`GptTmpl.inf`) | **stays** | 39 |
+| Security template (`GptTmpl.inf`) | **stays** | 40 |
 | Startup script | script stops running, value stays | 1 |
 | Firewall rules in the GPO | **removed at the next refresh** | 93 |
 
@@ -438,6 +436,9 @@ Get-ChildItem 'HKLM:\System\CurrentControlSet\Control\SecurityProviders\SCHANNEL
 # LSA protection and the security template values
 Remove-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Lsa' -Name RunAsPPL
 Remove-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Lsa' -Name DisableRestrictedAdminOutboundCreds
+
+# WebClient - the security template does not put a service back when the link goes
+Set-Service -Name WebClient -StartupType Manual
 
 # NetBIOS per interface, if the startup script has already run
 Get-ChildItem 'HKLM:\System\CurrentControlSet\Services\NetBT\Parameters\Interfaces' |
