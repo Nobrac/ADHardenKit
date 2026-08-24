@@ -109,7 +109,7 @@ is what step 2 fixes.
 | `-Interactive` | Ask before each topic, showing its **current state** on the directory server next to what it would become, with an explanation and a Microsoft article number. |
 | `-Profile Baseline\|Strict` | `Baseline` (70 settings) carries little or no compatibility risk. `Strict` adds 22 that need a maintenance window. |
 | `-Level Audit\|Enforce` | `Audit` deploys staged settings in their observing form. `Enforce` requires them. |
-| `-Area <groups>` | `Signing`, `LegacyAuth`, `CredentialProtection`, `Protocols`, `PolicyIntegrity`, `Logging`, `Services`. |
+| `-Area <groups>` | `Signing`, `LegacyAuth`, `CredentialProtection`, `Protocols`, `PolicyIntegrity`, `Logging`, `Services`, `LOLBins`. `LOLBins` is **not** in the default set — ask for it by name. |
 | `-MemberServerOu <dn>` | Where to link the member server GPOs. Without it they are created but left unlinked, and the run says so. The DC GPOs link to `OU=Domain Controllers` automatically. |
 | `-Force` | Proceed even when the scan found evidence that enforcing would break something, and skip the confirmation an unattended `-Apply` otherwise asks for. |
 
@@ -119,8 +119,8 @@ is what step 2 fixes.
 
 ## What it deploys
 
-**92 settings in 37 topics, plus 28 advanced audit subcategories.** Every group becomes its own GPO
-per role — thirteen small ones rather than two large ones. Names follow `-GpoNamePattern`, so they
+**92 settings in 37 topics, plus 28 advanced audit subcategories and 50 LOLBin firewall rules in 6
+topics.** Every group becomes its own GPO per role — fifteen small ones rather than two large ones. Names follow `-GpoNamePattern`, so they
 can match your own convention.
 
 | Group | Domain controllers | Member servers | Settings |
@@ -132,6 +132,7 @@ can match your own convention.
 | **PolicyIntegrity** | `ADHardenKit-DC-PolicyIntegrity` | `ADHardenKit-Member-PolicyIntegrity` | 3 / 3 |
 | **Logging** | `ADHardenKit-DC-Logging` | `ADHardenKit-Member-Logging` | 13 / 10 |
 | **Services** | `ADHardenKit-DC-Services` | — none, no setting applies | 1 / — |
+| **LOLBins** *(opt-in)* | `ADHardenKit-DC-LOLBins` | `ADHardenKit-Member-LOLBins` | 12 / 50 |
 
 | Group | What it covers |
 | --- | --- |
@@ -142,6 +143,7 @@ can match your own convention.
 | **PolicyIntegrity** | UNC hardened paths for SYSVOL and NETLOGON with SMB encryption (MS15-011) · forced reapplication of the security policy · no Group Policy caching, so a reboot applies the current policy and not the cached one |
 | **Logging** | 28 audit subcategories · PowerShell logging · command line in event 4688 · NTLM auditing · LDAP interface diagnostics · log sizes · `SCENoApplyLegacyAuditPolicy` |
 | **Services** | Print Spooler disabled on domain controllers |
+| **LOLBins** *(opt-in)* | Outbound network access blocked for the binaries used as download cradles and C2 channels — certutil, mshta, bitsadmin, regsvr32, rundll32, the script hosts, the .NET proxies — as **firewall rules inside the GPO**, so unlinking removes them again |
 
 The split is deliberate. When SMB signing turns out to have been holding up a NAS, you unlink the
 one GPO named `Signing` and everything else stays in force. With one big GPO the only lever is all
@@ -222,6 +224,64 @@ Set-SmbClientConfiguration -AuditServerDoesNotSupportSigning $true
 ```
 
 ---
+
+## LOLBins — the opt-in group
+
+```powershell
+# Is the Windows Firewall even on? (Nothing else is read for this group.)
+.\ADHardenKit.ps1 -Mode Scan -Area LOLBins -NoMenu
+
+# Write the rules, switched off, so they can be reviewed in the GPMC
+.\ADHardenKit.ps1 -Mode Deploy -Area LOLBins -MemberServerOu 'OU=Server,DC=example,DC=com' -Apply
+
+# Switch them on
+.\ADHardenKit.ps1 -Mode Deploy -Area LOLBins -Level Enforce -MemberServerOu 'OU=Server,DC=example,DC=com' -Apply
+```
+
+Outbound `Block` rules for 50 binaries, written into the GPO's own firewall policy. What lands
+where:
+
+| GPO | Baseline | Strict |
+| --- | :-: | :-: |
+| `ADHardenKit-Member-LOLBins` | 31 binaries, 63 rules | 50 binaries, 93 rules |
+| `ADHardenKit-DC-LOLBins` | 12 binaries, 20 rules | 12 binaries, 20 rules |
+
+**The domain controller list is short on purpose.** `certutil` fetching a CRL is how certificate
+validation works, and an outbound block there ends as an authentication outage that looks like
+anything but a firewall rule. Only binaries with no plausible role on a domain controller are in
+the DC set — the HTML and script hosts, the two TFTP/FTP clients, a handful of downloaders. None
+of them is a Strict setting, which is why both profiles give the same twenty rules.
+
+**`Baseline` follows impact, not the source tool's tier.** Baseline in this project means little or
+no compatibility risk, and blocking `rundll32` or `wscript` outbound does not meet that bar however
+sensible it is. Low impact is Baseline; Medium and High are Strict.
+
+**`-Level Audit` writes the rules and leaves them disabled — nothing is blocked.** It is a review
+step, so the change can be looked at in the GPMC before it bites. `-Level Enforce` switches them
+on. The run says so loudly either way; this is the one group where a green, successful-looking
+deployment can block nothing at all.
+
+**Nothing here reads an event log.** The staged rollout is `-Profile Baseline` first (31 binaries,
+the ones with no realistic breakage), then `-Interactive` to accept or decline whole topics, then
+`-Profile Strict` later if you want the rest. Plan mode — leaving off `-Apply` — prints the
+complete rule set without writing anything.
+
+Four things worth knowing before enforcing:
+
+- **A copy is not covered.** Firewall program rules match the image path, so `certutil.exe` copied
+  into `%TEMP%` walks straight past this. It is a layer under AppLocker or WDAC, not a substitute
+  for one.
+- **Some transfers do not belong to the binary.** BITS runs inside `svchost.exe`; blocking
+  `bitsadmin.exe` raises the bar without closing the path. Those entries are marked `Indirect`.
+- **A machine with the firewall off gets all of this and none of the effect.** `-Mode Scan -Area LOLBins`
+  checks the domain controllers' firewall state — one query, no event logs — and refuses to call the
+  run clean if it finds a profile switched off. It cannot check member servers, so sample one by hand.
+- **After enforcing, event 5157 is the diagnostic.** If something breaks, that event names the
+  binary and the destination that was blocked. It comes from the Filtering Platform Connection
+  subcategory, which this tool does not switch on — `auditpol` on the affected machine is enough.
+
+Unlike everything else here, **this group really does roll back by unlinking**: the rules live in
+policy, not in the machine's local firewall store.
 
 ## The rollout
 
@@ -349,6 +409,7 @@ and the result is less convenient than "unlink and you're done":
 | `registry.pol` outside those branches | stays | 18 |
 | Security template (`GptTmpl.inf`) | **stays** | 39 |
 | Startup script | script stops running, value stays | 1 |
+| Firewall rules in the GPO | **removed at the next refresh** | 93 |
 
 The security template is the surprise: a template sets values and does not take them back when the
 policy stops applying. That is most of the baseline — every Security Option, including LSA
@@ -394,7 +455,9 @@ the estate.
 - **Additive only.** The tool sets values and never removes what was there before. Unlinking stops enforcement without reverting most of it — see [rolling back](#rolling-back).
 - **Single domain per run.** For a forest, run once per domain.
 - **The scan reads one domain controller** for the current-state section. Settings differing between controllers in a multi-site domain will not be caught.
-- **Member servers are only reached through Group Policy.** The tool never connects to them.
+- **Member servers are only reached through Group Policy.** The tool never connects to them, which is also why the LOLBin scan can only report what ran on the domain controllers.
+- **`LOLBins` needs the NetSecurity module** on the host running the tool (RSAT). Every other group deploys without it, and a missing module fails that group alone rather than the run.
+- **`-NoEventLog` did nothing up to 1.2.0.** It was accepted, documented and never read. From 1.3.0 it skips the unsigned-LDAP-bind and NTLM sections, which are the only two that touch an event log.
 - **Not included:** tiering, OU structure, delegation, administrative accounts, user rights assignment, LAPS, authentication policy silos, AppLocker, BitLocker, Defender. The tier boundary above this layer is [ADTierKit](https://github.com/nopcap-tech/ADTierKit).
 
 ---

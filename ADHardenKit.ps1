@@ -31,6 +31,7 @@
         ADHardenKit-DC-Protocols                ADHardenKit-Member-Protocols
         ADHardenKit-DC-Logging                  ADHardenKit-Member-Logging
         ADHardenKit-DC-Services
+        ADHardenKit-DC-LOLBins                  ADHardenKit-Member-LOLBins
 
     That is deliberate. When SMB signing turns out to have been holding up a NAS, you unlink one
     GPO named Signing and everything else stays in force. With one big GPO the only lever is all
@@ -87,8 +88,15 @@
 
     .PARAMETER Area
     Restrict the run to some of the setting groups: Signing, LegacyAuth, CredentialProtection,
-    Protocols, PolicyIntegrity, Logging, Services. Each group becomes its own GPO per role, so a group that turns
+    Protocols, PolicyIntegrity, Logging, Services, LOLBins. Each group becomes its own GPO per role, so a group that turns
     out to break something can be unlinked on its own without losing the rest.
+
+    LOLBins is not in the default set and has to be asked for by name. It blocks the outbound
+    network access of the binaries attackers use as download cradles and C2 channels, as firewall
+    rules inside the GPO - so unlinking the GPO removes them again, which is the whole reason it
+    is built this way rather than as a startup script. It needs the NetSecurity module on the
+    host running the tool, and it is worth nothing at all on a machine whose Windows Firewall is
+    switched off: run Scan with -Area LOLBins first, which reports exactly that.
 
     .PARAMETER Apply
     Deploy mode only. Without it nothing is written.
@@ -124,7 +132,9 @@
 
     .PARAMETER NoEventLog
     Skip the event log analysis in Scan mode. Useful on a domain controller where the logs are
-    large enough that reading them takes longer than the rest of the run.
+    large enough that reading them takes longer than the rest of the run. It skips the unsigned
+    LDAP bind and NTLM sections and nothing else. Note that up to 1.2.0 this switch was accepted
+    and then ignored - it is honoured from 1.3.0 onward.
 
     .PARAMETER MemberServerOu
     Distinguished name of the OU the member server GPOs are linked to. Without it they are created
@@ -196,7 +206,7 @@ param(
     [ValidateSet('Audit', 'Enforce')]
     [string]$Level = 'Audit',
 
-    [ValidateSet('Signing', 'LegacyAuth', 'CredentialProtection', 'Protocols', 'PolicyIntegrity', 'Logging', 'Services')]
+    [ValidateSet('Signing', 'LegacyAuth', 'CredentialProtection', 'Protocols', 'PolicyIntegrity', 'Logging', 'Services', 'LOLBins')]
     [string[]]$Area = @('Signing', 'LegacyAuth', 'CredentialProtection', 'Protocols', 'PolicyIntegrity', 'Logging', 'Services'),
 
     [string]$Server,
@@ -226,7 +236,7 @@ param(
 
 # Bumped whenever the baseline or a mechanism changes. Printed on every run and carried into the
 # report, so "which version produced this" is answerable from a pasted log rather than guessed at.
-$script:HardenKitVersion = '1.2.0'
+$script:HardenKitVersion = '1.3.0'
 
 $ErrorActionPreference = 'Stop'
 
@@ -252,6 +262,9 @@ $script:DecisionCache = @{}
 $script:LiveCache = @{}
 $script:ScopeBaseline = @()
 $script:ScopeAuditPolicy = @()
+# Every firewall rule this tool writes carries this Group, which is what makes the whole set
+# findable and removable without matching on localised display names.
+$script:LolFirewallGroup = 'ADHardenKit-LOLBins'
 
 ####################################################################################################
 #region Core
@@ -1418,6 +1431,32 @@ foreach ($iface in (Get-ChildItem -LiteralPath $key -ErrorAction SilentlyContinu
             Why = 'A full security log that refuses to overwrite stops recording, and with CrashOnAuditFail set it stops the machine. Overwriting oldest is the sane default once the size is large enough.'
         })
 
+    # -- LOLBins ---------------------------------------------------------------------------------
+    # Generated from the catalog rather than written out fifty times, so adding a binary is one
+    # row there and nothing here. Staged: at Level Audit the rule is written into the GPO but
+    # left disabled, at Level Enforce it is active. That is a review step, not an observation -
+    # a block rule has no form that watches without blocking, and this group does not try to
+    # invent one. What makes the rollout safe here is -Profile, -Interactive and plan mode.
+    foreach ($lol in (Get-HardenLolBinCatalog)) {
+        $s.Add([ordered]@{
+                Id = "LOLBin-$($lol.Id)"; Topic = $lol.Topic; Group = 'LOLBins'
+                Name = "$($lol.Binary) blocked outbound"
+                Type = 'FirewallRule'; Target = $lol.Target; Profile = $lol.Profile; Staged = $true
+                Programs = $lol.Paths
+                Impact = $lol.Impact; Reach = $lol.Reach
+                Why = $lol.Why
+                Observe = $(
+                    $parts = [System.Collections.Generic.List[string]]::new()
+                    if ($lol.Reach -eq 'Indirect') {
+                        $parts.Add('The transfer runs inside a Windows service rather than this binary, so the rule raises the bar without closing the path.')
+                    }
+                    $parts.Add('Firewall program rules match the image path. A copy of the binary somewhere else is not covered - this is a layer under AppLocker or WDAC, not a replacement for them.')
+                    $parts.Add("If this turns out to break something after enforcing, event 5157 on the affected machine names the binary and the destination - it is the Filtering Platform Connection subcategory and it is not switched on by this tool.")
+                    $parts -join ' '
+                )
+            })
+    }
+
     return $s.ToArray()
 }
 
@@ -1477,6 +1516,121 @@ function Get-HardenAuditPolicy {
         $out.Add([pscustomobject]@{
                 Subcategory = $r[0]; Guid = $r[1]
                 DcValue     = $r[2]; MemberValue = $r[3]; Why = $r[4]
+            })
+    }
+    return $out.ToArray()
+}
+
+function Get-HardenLolBinCatalog {
+    <#
+        .SYNOPSIS
+        The living-off-the-land binaries whose outbound network access is blocked, as data.
+
+        .DESCRIPTION
+        Ported from LOLBinGuard, with three deliberate differences that follow from delivering
+        this through Group Policy rather than on one machine at a time:
+
+          - Paths are literal environment-variable strings, not resolved against the local disk.
+            The firewall service expands them on the client, and a rule naming a binary that is
+            not installed there is simply inert. That removes the probing LOLBinGuard needed and
+            makes one rule set correct for every machine in the OU.
+          - Wildcard paths are gone. A firewall program rule matches one image path and does not
+            accept a wildcard, so the entries that only ever existed as a glob - the Defender
+            platform folder, the graphics driver store, the Visual Studio MSBuild copies - lost
+            those variants. GfxDownloadWrapper had nothing else and is not in this list at all.
+          - Per-user paths are gone for the same reason. A machine-scope rule cannot resolve
+            %LOCALAPPDATA%, which is why the OneDrive updater is missing.
+
+        Profile follows Impact rather than the LOLBinGuard tier. Baseline in this tool means
+        little or no compatibility risk, and blocking rundll32 or wscript outbound does not meet
+        that bar however sensible it is - so Low impact is Baseline and everything else is
+        Strict. That is a stricter reading than the tier names suggest and it is the reading the
+        rest of the tool already uses.
+
+        Target is Member for all but a short list. A domain controller reaching the network
+        through certutil is worth knowing about, but certutil is also how it fetches a CRL, and
+        an outbound block there can end as a certificate validation failure that looks like an
+        authentication outage. Only binaries with no plausible role on a domain controller are
+        marked Both.
+
+        Reach Indirect means the transfer is performed by a Windows service rather than the
+        binary itself - BITS through svchost.exe is the usual case. The rule raises the bar and
+        does not close the path.
+
+        Id, binary, topic, profile, target, impact, reach, paths, why.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $sys = '%SystemRoot%\System32'
+    $wow = '%SystemRoot%\SysWOW64'
+    $net4 = '%SystemRoot%\Microsoft.NET\Framework\v4.0.30319'
+    $net4x = '%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319'
+    $net2 = '%SystemRoot%\Microsoft.NET\Framework\v2.0.50727'
+    $net2x = '%SystemRoot%\Microsoft.NET\Framework64\v2.0.50727'
+    $win = '%SystemRoot%'
+
+    # The leading comma on every row is load-bearing, exactly as in the audit policy above:
+    # without it @() flattens each row into loose values.
+    $rows = @(
+        , @('certutil', 'certutil.exe', 'Download cradles', 'Baseline', 'Member', 'Low', 'Direct', @("$sys\certutil.exe", "$wow\certutil.exe"), 'Downloads arbitrary files (-urlcache -f), decodes base64 payloads, contacts URLs for CRL checks.')
+        , @('bitsadmin', 'bitsadmin.exe', 'Download cradles', 'Baseline', 'Member', 'Low', 'Indirect', @("$sys\bitsadmin.exe", "$wow\bitsadmin.exe"), 'Classic background download cradle (/transfer) and persistence via job notify commands. Transfer runs inside the BITS service (svchost.exe) - the rule raises the bar but does not fully stop it.')
+        , @('desktopimgdownldr', 'desktopimgdownldr.exe', 'Download cradles', 'Baseline', 'Both', 'Low', 'Indirect', @("$sys\desktopimgdownldr.exe"), 'Spotlight image downloader, abused to fetch arbitrary URLs. Also uses BITS under the hood.')
+        , @('mshta', 'mshta.exe', 'Script and markup hosts', 'Baseline', 'Both', 'Low', 'Direct', @("$sys\mshta.exe", "$wow\mshta.exe"), 'Executes HTA / inline VBScript-JScript straight from a remote URL. Extremely common in phishing chains.')
+        , @('hh', 'hh.exe', 'Script and markup hosts', 'Baseline', 'Both', 'Low', 'Direct', @('%SystemRoot%\hh.exe'), 'HTML Help viewer, loads remote CHM files and executes embedded script.')
+        , @('ieexec', 'IEExec.exe', 'Script and markup hosts', 'Baseline', 'Both', 'Low', 'Direct', @("$net2\IEExec.exe", "$net2x\IEExec.exe"), 'Downloads and runs a .NET assembly from a URL.')
+        , @('presentationhost', 'PresentationHost.exe', 'Script and markup hosts', 'Baseline', 'Both', 'Low', 'Direct', @("$sys\PresentationHost.exe", "$wow\PresentationHost.exe"), 'Runs remote XBAP / WPF browser applications.')
+        , @('cmstp', 'cmstp.exe', 'Script and markup hosts', 'Baseline', 'Both', 'Low', 'Direct', @("$sys\cmstp.exe", "$wow\cmstp.exe"), 'Installs a connection manager INF from a remote path, bypasses AppLocker and UAC.')
+        , @('ftp', 'ftp.exe', 'Remote file transfer', 'Baseline', 'Both', 'Low', 'Direct', @("$sys\ftp.exe", "$wow\ftp.exe"), 'Scripted download/upload channel (-s:script) and command execution via "!".')
+        , @('tftp', 'tftp.exe', 'Remote file transfer', 'Baseline', 'Both', 'Low', 'Direct', @("$sys\tftp.exe", "$wow\tftp.exe"), 'Silent UDP file transfer, no authentication, very popular in post-exploitation.')
+        , @('esentutl', 'esentutl.exe', 'Remote file transfer', 'Baseline', 'Member', 'Low', 'Direct', @("$sys\esentutl.exe", "$wow\esentutl.exe"), 'Copies files from UNC / WebDAV sources, also dumps locked files like NTDS.dit.')
+        , @('expand', 'expand.exe', 'Remote file transfer', 'Baseline', 'Member', 'Low', 'Direct', @("$sys\expand.exe", "$wow\expand.exe"), 'Copies/expands files directly from a remote UNC or WebDAV share.')
+        , @('extrac32', 'extrac32.exe', 'Remote file transfer', 'Baseline', 'Member', 'Low', 'Direct', @("$sys\extrac32.exe", "$wow\extrac32.exe"), 'Extracts CAB files from remote shares, doubles as a file copy utility.')
+        , @('replace', 'replace.exe', 'Remote file transfer', 'Baseline', 'Member', 'Low', 'Direct', @("$sys\replace.exe", "$wow\replace.exe"), 'Copies files from a remote share into a local path.')
+        , @('print', 'print.exe', 'Remote file transfer', 'Baseline', 'Member', 'Low', 'Direct', @("$sys\print.exe", "$wow\print.exe"), 'Abused as a file copy tool to and from UNC paths.')
+        , @('makecab', 'makecab.exe', 'Remote file transfer', 'Baseline', 'Member', 'Low', 'Direct', @("$sys\makecab.exe", "$wow\makecab.exe"), 'Packs data and can write the archive straight to a remote WebDAV/UNC target (exfiltration).')
+        , @('diantz', 'diantz.exe', 'Remote file transfer', 'Baseline', 'Member', 'Low', 'Direct', @("$sys\diantz.exe", "$wow\diantz.exe"), 'makecab twin, same exfiltration trick.')
+        , @('findstr', 'findstr.exe', 'Remote file transfer', 'Baseline', 'Member', 'Low', 'Direct', @("$sys\findstr.exe", "$wow\findstr.exe"), 'Reads and writes files over UNC/WebDAV, used to stage payloads. Local usage is completely unaffected by an outbound block.')
+        , @('odbcconf', 'odbcconf.exe', 'Signed proxy execution', 'Baseline', 'Member', 'Low', 'Direct', @("$sys\odbcconf.exe", "$wow\odbcconf.exe"), 'Loads a DLL via REGSVR action, response files can come from a remote path.')
+        , @('xwizard', 'xwizard.exe', 'Script and markup hosts', 'Baseline', 'Both', 'Low', 'Direct', @("$sys\xwizard.exe", "$wow\xwizard.exe"), 'Runs wizard definitions, can pull remote XML and side-load a DLL.')
+        , @('certreq', 'certreq.exe', 'Download cradles', 'Baseline', 'Member', 'Low', 'Direct', @("$sys\certreq.exe", "$wow\certreq.exe"), 'certreq -Post uploads arbitrary files to a URL and writes the response to disk.')
+        , @('imewdbld', 'IMEWDBLD.exe', 'Download cradles', 'Baseline', 'Both', 'Low', 'Direct', @("$sys\IME\SHARED\IMEWDBLD.EXE"), 'IME dictionary updater, abused as a generic HTTP downloader.')
+        , @('syncappvpublishingserver', 'SyncAppvPublishingServer.exe', 'Script and markup hosts', 'Baseline', 'Both', 'Low', 'Direct', @("$sys\SyncAppvPublishingServer.exe"), 'App-V publishing client, abused to reach attacker infrastructure and to proxy PowerShell.')
+        , @('configsecuritypolicy', 'ConfigSecurityPolicy.exe', 'Download cradles', 'Baseline', 'Member', 'Low', 'Direct', @('%PROGRAMFILES%\Windows Defender\ConfigSecurityPolicy.exe'), 'Defender helper that can upload local files to a remote URL.')
+        , @('installutil', 'InstallUtil.exe', 'Signed proxy execution', 'Baseline', 'Member', 'Low', 'Direct', @("$net4\InstallUtil.exe", "$net4x\InstallUtil.exe", "$net2\InstallUtil.exe", "$net2x\InstallUtil.exe"), 'Executes attacker .NET assemblies (uninstall method) which then open their own sockets.')
+        , @('regasm', 'RegAsm.exe', 'Signed proxy execution', 'Baseline', 'Member', 'Low', 'Direct', @("$net4\RegAsm.exe", "$net4x\RegAsm.exe", "$net2\RegAsm.exe", "$net2x\RegAsm.exe"), 'Runs .NET code in a signed Microsoft process (ComRegisterFunction).')
+        , @('regsvcs', 'RegSvcs.exe', 'Signed proxy execution', 'Baseline', 'Member', 'Low', 'Direct', @("$net4\RegSvcs.exe", "$net4x\RegSvcs.exe", "$net2\RegSvcs.exe", "$net2x\RegSvcs.exe"), 'RegAsm twin, same execution primitive.')
+        , @('workflowcompiler', 'Microsoft.Workflow.Compiler.exe', 'Signed proxy execution', 'Baseline', 'Member', 'Low', 'Direct', @("$net4\Microsoft.Workflow.Compiler.exe", "$net4x\Microsoft.Workflow.Compiler.exe"), 'Compiles and runs arbitrary C# from an XML file, popular AppLocker bypass.')
+        , @('netsh', 'netsh.exe', 'Remote administration', 'Baseline', 'Member', 'Low', 'Direct', @("$sys\netsh.exe", "$wow\netsh.exe"), 'Remote administration (-r), helper DLL persistence, port proxy setup. Local netsh commands keep working, only its own network traffic is blocked.')
+        , @('wscript', 'wscript.exe', 'Script and markup hosts', 'Strict', 'Member', 'Medium', 'Direct', @("$sys\wscript.exe", "$wow\wscript.exe"), 'Windows Script Host - VBS/JS droppers use XMLHTTP or WinHttp to fetch stage 2. Breaks legacy VBS logon scripts that access network resources.')
+        , @('cscript', 'cscript.exe', 'Script and markup hosts', 'Strict', 'Member', 'Medium', 'Direct', @("$sys\cscript.exe", "$wow\cscript.exe"), 'Console flavour of the Windows Script Host, same download cradles. Breaks legacy VBS admin scripts that access network resources.')
+        , @('regsvr32', 'regsvr32.exe', 'Signed proxy execution', 'Strict', 'Member', 'Medium', 'Direct', @("$sys\regsvr32.exe", "$wow\regsvr32.exe"), 'Squiblydoo: loads a remote .sct scriptlet over HTTP and executes it, signed-binary proxy. Local DLL registration is not affected.')
+        , @('rundll32', 'rundll32.exe', 'Signed proxy execution', 'Strict', 'Member', 'Medium', 'Direct', @("$sys\rundll32.exe", "$wow\rundll32.exe"), 'Universal proxy: javascript: protocol handler, ieadvpack/advpack remote INF, DLL side-loading. A few Windows components use rundll32 for network tasks - test before rolling out broadly.')
+        , @('wmic', 'WMIC.exe', 'Remote administration', 'Strict', 'Member', 'Medium', 'Direct', @("$sys\wbem\WMIC.exe", "$wow\wbem\WMIC.exe"), 'Remote process creation (/node:) and XSL script execution from a URL. Breaks "wmic /node:REMOTEHOST" style administration; local queries keep working.')
+        , @('curl', 'curl.exe', 'Download cradles', 'Strict', 'Member', 'Medium', 'Direct', @("$sys\curl.exe"), 'Built-in since Windows 10 1803 - the most convenient download/exfil tool on the box. Developers will notice this one. Exclude it on dev workstations if needed.')
+        , @('msbuild', 'MSBuild.exe', 'Signed proxy execution', 'Strict', 'Member', 'Medium', 'Direct', @("$net4\MSBuild.exe", "$net4x\MSBuild.exe"), 'Inline task C# execution and the DownloadFile task - a full compiler and downloader in one signed binary. Breaks NuGet restore via MSBuild on developer machines.')
+        , @('dfsvc', 'dfsvc.exe', 'Signed proxy execution', 'Strict', 'Member', 'Medium', 'Direct', @("$net4\dfsvc.exe", "$net4x\dfsvc.exe"), 'ClickOnce deployment service - downloads and runs remote applications. Breaks all ClickOnce applications.')
+        , @('schtasks', 'schtasks.exe', 'Remote administration', 'Baseline', 'Member', 'Low', 'Direct', @("$sys\schtasks.exe", "$wow\schtasks.exe"), 'Creates scheduled tasks on remote hosts (/s) - lateral movement and persistence. Local task management is unaffected.')
+        , @('winrs', 'winrs.exe', 'Remote administration', 'Strict', 'Member', 'Medium', 'Direct', @("$sys\winrs.exe"), 'WinRM remote shell client, a favourite for lateral movement. Breaks outbound winrs usage from this host.')
+        , @('appvlp', 'AppVLP.exe', 'Signed proxy execution', 'Baseline', 'Both', 'Low', 'Direct', @('%PROGRAMFILES%\Microsoft Office\root\client\AppVLP.exe', '%PROGRAMFILES(X86)%\Microsoft Office\root\client\AppVLP.exe'), 'Office application virtualisation helper, used to bypass ASR rules and launch payloads.')
+        , @('powershell', 'powershell.exe', 'Remote administration', 'Strict', 'Member', 'High', 'Direct', @("$sys\WindowsPowerShell\v1.0\powershell.exe", "$wow\WindowsPowerShell\v1.0\powershell.exe"), 'The download cradle: IEX (New-Object Net.WebClient).DownloadString(...), Invoke-WebRequest, remoting. HIGH IMPACT: breaks Invoke-WebRequest, PSGallery, Update-Help, outbound remoting and many admin scripts.')
+        , @('powershell_ise', 'powershell_ise.exe', 'Remote administration', 'Strict', 'Member', 'Medium', 'Direct', @("$sys\WindowsPowerShell\v1.0\powershell_ise.exe", "$wow\WindowsPowerShell\v1.0\powershell_ise.exe"), 'Same runtime as powershell.exe, often forgotten when hardening.')
+        , @('msiexec', 'msiexec.exe', 'Signed proxy execution', 'Strict', 'Member', 'High', 'Direct', @("$sys\msiexec.exe", "$wow\msiexec.exe"), 'Installs an MSI package straight from a URL (msiexec /i http://...), signed and often allow-listed. HIGH IMPACT: breaks every web-hosted installer and some software deployment solutions.')
+        , @('ssh', 'ssh.exe', 'Remote file transfer', 'Strict', 'Member', 'High', 'Direct', @("$sys\OpenSSH\ssh.exe"), 'Built-in OpenSSH client: tunnels, port forwarding, C2 over SSH. HIGH IMPACT on developer and admin machines.')
+        , @('scp', 'scp.exe', 'Remote file transfer', 'Strict', 'Member', 'High', 'Direct', @("$sys\OpenSSH\scp.exe"), 'File transfer over SSH - clean, encrypted exfiltration channel. HIGH IMPACT: breaks deployment scripts and any scp-based file copy from this host.')
+        , @('sftp', 'sftp.exe', 'Remote file transfer', 'Strict', 'Member', 'High', 'Direct', @("$sys\OpenSSH\sftp.exe"), 'Interactive file transfer over SSH - clean, encrypted exfiltration channel. HIGH IMPACT: breaks all sftp client usage from this host.')
+        , @('wsl', 'wsl.exe', 'Linux subsystems', 'Strict', 'Member', 'High', 'Indirect', @("$sys\wsl.exe"), 'Runs Linux tooling (curl, nc, python) outside most Windows security telemetry. Linux traffic may leave through the WSL virtual adapter and bypass this rule - treat as partial.')
+        , @('bash', 'bash.exe', 'Linux subsystems', 'Strict', 'Member', 'Medium', 'Indirect', @("$sys\bash.exe"), 'Legacy WSL entry point, same idea as wsl.exe.')
+        , @('dotnet', 'dotnet.exe', 'Signed proxy execution', 'Strict', 'Member', 'High', 'Direct', @('%PROGRAMFILES%\dotnet\dotnet.exe', '%PROGRAMFILES(X86)%\dotnet\dotnet.exe'), 'Signed host that runs arbitrary managed assemblies and DLLs, plus its own restore traffic. HIGH IMPACT: breaks dotnet restore/run on developer machines.')
+        , @('mpcmdrun', 'MpCmdRun.exe', 'Download cradles', 'Strict', 'Member', 'High', 'Direct', @('%PROGRAMFILES%\Windows Defender\MpCmdRun.exe'), 'Defender CLI with -DownloadFile: a Microsoft-signed downloader living inside the AV itself. HIGH IMPACT: can interfere with Defender signature update fallbacks. Test carefully.')
+    )
+
+    $out = [System.Collections.Generic.List[object]]::new()
+    foreach ($r in $rows) {
+        $out.Add([pscustomobject]@{
+                Id      = $r[0]; Binary = $r[1]; Topic = $r[2]; Profile = $r[3]
+                Target  = $r[4]; Impact = $r[5]; Reach = $r[6]
+                Paths   = @($r[7]); Why = $r[8]
             })
     }
     return $out.ToArray()
@@ -1566,6 +1720,31 @@ function Get-HardenLiveValue {
             }
             return ($parts -join ', ')
         }
+        'FirewallRule' {
+            # There is no per-binary state to read - a rule either exists in the policy or it
+            # does not, and the policy is what this run is about to write. What is worth putting
+            # in this column instead is the one fact that decides whether the whole topic means
+            # anything: is the Windows Firewall actually switched on. Where it is off, every rule
+            # in this group is written, applied, and ignored.
+            #
+            # Read from the directory server, like the startup script row above, and labelled
+            # with the server name - most entries here target member servers, whose own state is
+            # not visible from here.
+            $key = "$($ctx.Server)|fwprofile"
+            if ($script:LiveCache.ContainsKey($key)) { return $script:LiveCache[$key] }
+            $result = 'firewall state unknown'
+            try {
+                $off = @(Invoke-Command -ComputerName $ctx.Server -ScriptBlock {
+                        Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop |
+                            Where-Object { -not $_.Enabled } | ForEach-Object { $_.Name }
+                    } -ErrorAction Stop)
+                $result = if ($off.Count -eq 0) { "firewall on ($($ctx.Server))" }
+                else { "OFF for $($off -join ', ') on $($ctx.Server)" }
+            }
+            catch { }
+            $script:LiveCache[$key] = $result
+            return $result
+        }
         'StartupScript' {
             # There is no single registry value to read, so report what the machine looks like
             # today - the state the script would correct. Read from the directory server; a
@@ -1646,6 +1825,13 @@ function Get-HardenTargetLabel {
                     4 { 'Disabled' }
                     default { "startup mode $($Item.StartupMode)" }
                 })
+        }
+        'FirewallRule' {
+            # Said plainly rather than dressed up as an observation. At Level Audit this group
+            # writes the rules and switches them off; that is a staging step because it makes the
+            # change reviewable in the GPMC before it bites, but it does not watch anything.
+            if ($Level -eq 'Audit') { return 'rule written, disabled' }
+            return "outbound blocked ($(@($Item.Programs).Count) path(s))"
         }
         # Value only, no name prefix: the row already carries the setting name, and the live
         # reader has to produce a string that matches this one exactly for "already there" to work.
@@ -2318,6 +2504,279 @@ function Set-HardenRegistrySetting {
     return 'Planned'
 }
 
+function Set-HardenFirewallRules {
+    <#
+        .SYNOPSIS
+        Writes the LOLBin outbound block rules into the GPO's firewall policy.
+
+        .DESCRIPTION
+        The rules go into Group Policy rather than onto machines, for the same reason as
+        everything else here: unlinking the GPO takes them away again. A rule written into a
+        machine's local firewall store survives the GPO being unlinked, deleted or forgotten, and
+        with ninety-odd of them across an OU that is not a rollback anyone would enjoy.
+
+        Mechanically this is Open-NetGPO / Save-NetGPO. Nothing reaches SYSVOL until Save-NetGPO
+        is called, so the error path simply abandons the session and commits nothing.
+
+        Plan mode never opens a session. The NetSecurity cmdlets honour -WhatIf themselves, so
+        under a propagated $WhatIfPreference the session would come back empty and every later
+        read would misreport the GPO as empty. A plan describes intent; reading the real state is
+        what Audit mode is for, and Audit mode carries no WhatIf.
+
+        Results are reported twice on purpose: one FirewallRules row per GPO carrying the counts,
+        and one row per binary, because the report's topic cards find their state by setting id
+        and would otherwise show six LOLBin topics as "not in scope" under a deployment that
+        wrote all of them.
+
+        Three things that are easy to get wrong:
+
+          - The image path is a literal string with environment variables in it. The firewall
+            service expands it on the client, so %SystemRoot%\System32\certutil.exe is correct
+            everywhere and a rule for a binary that is not installed is inert rather than an
+            error. Wildcards are not supported and the catalog has none left.
+          - Every rule carries the Group ADHardenKit-LOLBins. That is what makes the set findable
+            for the removal sweep below - a rule left over from a wider profile or a topic that
+            was declined this time round is deleted rather than quietly kept.
+          - Rule descriptions reject some characters and long strings outright, with an error that
+            names neither. They are sanitised to plain ASCII and truncated before use.
+
+        A changed catalog path is caught through the application filters: their InstanceID is the
+        rule's, which ties program to rule without one query each. When that read fails or the
+        IDs do not line up, the drift check quietly does nothing - re-creating ninety rules on
+        every scheduled run because of a wrong assumption here would be worse than missing the
+        rare changed path.
+
+        The Enabled state carries the level: at Audit the rules are written and switched off, at
+        Enforce they are on. Switching a whole group on afterwards is one run with -Level Enforce.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][object]$Gpo,
+        [Parameter(Mandatory)][string]$GpoName,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Items,
+        [Parameter(Mandatory)][ValidateSet('Audit', 'Enforce')][string]$Level,
+        [switch]$AuditOnly
+    )
+
+    $ctx = Get-HardenContext
+    $enabledWanted = ($Level -eq 'Enforce')
+    $stateWord = if ($enabledWanted) { 'enabled' } else { 'written but disabled' }
+
+    # One action per binary alongside the per-GPO row, so the report can say what happened to
+    # certutil rather than only that "FirewallRules" happened to a GPO.
+    $emitItems = {
+        param([string]$ItemResult, [string]$ItemDetail)
+        foreach ($it in $Items) {
+            Add-HardenAction -Area 'LOLBins' -Setting $it.Id -Target $GpoName -Result $ItemResult -Detail $ItemDetail
+        }
+    }
+
+    # -- what this run wants the GPO to contain ----------------------------------------------
+    $desired = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in $Items) {
+        $index = 0
+        foreach ($program in @($item.Programs)) {
+            # The folder, with the %SystemRoot% prefix taken off, as the human-readable tag.
+            # Not just the leaf: Framework and Framework64 both end in v4.0.30319, and only the
+            # %SystemRoot% prefix comes off - stripping the Program Files prefixes too would
+            # collapse %ProgramFiles%\dotnet and %ProgramFiles(x86)%\dotnet onto one display
+            # name, and two rules cannot usefully share it.
+            $folder = Split-Path $program -Parent
+            $tag = ($folder -replace '(?i)^%SystemRoot%\\', '')
+
+            $desired.Add([pscustomobject]@{
+                    Name        = "ADHardenKit-LOLBin-$($item.Id -replace '^LOLBin-', '')-$index"
+                    DisplayName = "ADHardenKit - $($item.Name -replace ' blocked outbound', '') outbound block [$tag]"
+                    Program     = $program
+                    Enabled     = $enabledWanted
+                    Description = (Get-HardenFirewallDescription -Item $item -Program $program)
+                    ItemId      = $item.Id
+                })
+            $index++
+        }
+    }
+
+    if ($desired.Count -eq 0) { return 'Compliant' }
+
+    if (-not (Get-Command -Name 'Open-NetGPO' -ErrorAction SilentlyContinue)) {
+        # Not a prerequisite failure for the whole run: every other group deploys without this
+        # module, and failing a Logging deployment because the firewall cmdlets are absent would
+        # be the tool getting in its own way.
+        Write-HardenLog -Message 'The NetSecurity module is not available, so the firewall rules cannot be written. Install RSAT on this host, or run the LOLBins group from one that has it.' -Level Error
+        Add-HardenAction -Area 'LOLBins' -Setting 'FirewallRules' -Target $GpoName -Result 'Failed' `
+            -Detail 'NetSecurity module missing' -Severity 'High'
+        & $emitItems 'Failed' 'NetSecurity module missing'
+        return 'Failed'
+    }
+
+    # Plan mode, decided before any session exists - see the docstring for why.
+    if (-not $AuditOnly -and -not $PSCmdlet.ShouldProcess($GpoName, "Write $($desired.Count) LOLBin firewall rule(s)")) {
+        Write-HardenLog -Message "Firewall rules: $($desired.Count) rule(s) would be written, $stateWord" -Level Info
+        Add-HardenAction -Area 'LOLBins' -Setting 'FirewallRules' -Target $GpoName -Result 'Planned' `
+            -Detail "$($desired.Count) rule(s), $stateWord"
+        & $emitItems 'Planned' $stateWord
+        return 'Planned'
+    }
+
+    if (-not $Gpo -or $Gpo.Id -eq [guid]::Empty) {
+        # The deployment loop does not call this function in audit mode when the GPO is missing,
+        # and a real apply always has one. Kept as a guard because a null here would otherwise
+        # surface as an Open-NetGPO error naming the wrong cause.
+        Add-HardenAction -Area 'LOLBins' -Setting 'FirewallRules' -Target $GpoName -Result 'Missing' `
+            -Detail 'GPO does not exist, so none of its rules do'
+        & $emitItems 'Missing' 'GPO does not exist'
+        return 'Missing'
+    }
+
+    $store = "$($ctx.DomainFqdn)\$GpoName"
+    $session = $null
+    try {
+        $session = Open-NetGPO -PolicyStore $store -DomainController $ctx.Server -ErrorAction Stop
+    }
+    catch {
+        Write-HardenLog -Message "Could not open the firewall policy of $GpoName - $($_.Exception.Message)" -Level Error
+        Add-HardenAction -Area 'LOLBins' -Setting 'FirewallRules' -Target $GpoName -Result 'Failed' `
+            -Detail $_.Exception.Message -Severity 'High'
+        & $emitItems 'Failed' 'The firewall policy could not be opened - see the FirewallRules row'
+        return 'Failed'
+    }
+
+    try {
+        $existing = @()
+        try {
+            $existing = @(Get-NetFirewallRule -GPOSession $session -ErrorAction Stop |
+                    Where-Object { $_.Group -eq $script:LolFirewallGroup })
+        }
+        catch { $existing = @() }
+
+        $appByRule = @{}
+        try {
+            foreach ($f in @(Get-NetFirewallApplicationFilter -GPOSession $session -ErrorAction Stop)) {
+                if ($f.InstanceID) { $appByRule[[string]$f.InstanceID] = [string]$f.Program }
+            }
+        }
+        catch { $appByRule = @{} }
+
+        $byName = @{}
+        foreach ($r in $existing) { $byName[$r.Name] = $r }
+        $wanted = @{}
+        foreach ($d in $desired) { $wanted[$d.Name] = $d }
+
+        $toCreate = @($desired | Where-Object { -not $byName.ContainsKey($_.Name) })
+        $toRemove = @($existing | Where-Object { -not $wanted.ContainsKey($_.Name) })
+        $toRecreate = @($desired | Where-Object {
+                $byName.ContainsKey($_.Name) -and $appByRule.ContainsKey($_.Name) -and
+                $appByRule[$_.Name] -and ($appByRule[$_.Name] -ne $_.Program)
+            })
+        $recreateNames = @($toRecreate | ForEach-Object { $_.Name })
+        $toToggle = @($desired | Where-Object {
+                $byName.ContainsKey($_.Name) -and $_.Name -notin $recreateNames -and
+                (($byName[$_.Name].Enabled -eq 'True') -ne $_.Enabled)
+            })
+
+        if ($toCreate.Count -eq 0 -and $toRemove.Count -eq 0 -and $toRecreate.Count -eq 0 -and $toToggle.Count -eq 0) {
+            Write-HardenLog -Message "Firewall rules: all $($desired.Count) already as intended ($stateWord)" -Level Skip
+            Add-HardenAction -Area 'LOLBins' -Setting 'FirewallRules' -Target $GpoName -Result 'Compliant' `
+                -Detail "$($desired.Count) rule(s), $stateWord"
+            & $emitItems 'Compliant' $stateWord
+            return 'Compliant'
+        }
+
+        $delta = "$($toCreate.Count) to add, $($toRecreate.Count) to re-create for a changed path, $($toToggle.Count) to switch, $($toRemove.Count) to remove"
+
+        if ($AuditOnly) {
+            $auditResult = if ($existing.Count -eq 0) { 'Missing' } else { 'Drift' }
+            Write-HardenLog -Message "Firewall rules: $delta" -Level Info
+            Add-HardenAction -Area 'LOLBins' -Setting 'FirewallRules' -Target $GpoName -Result $auditResult `
+                -Detail $delta -Severity 'Medium'
+            & $emitItems $auditResult $(if ($auditResult -eq 'Missing') { 'No rule in the GPO' } else { $delta })
+            return $auditResult
+        }
+
+        foreach ($d in $toCreate) {
+            New-NetFirewallRule -GPOSession $session `
+                -Name $d.Name -DisplayName $d.DisplayName -Group $script:LolFirewallGroup `
+                -Description $d.Description -Direction Outbound -Action Block `
+                -Program $d.Program -Profile Any `
+                -Enabled $(if ($d.Enabled) { 'True' } else { 'False' }) -ErrorAction Stop | Out-Null
+        }
+        foreach ($d in $toRecreate) {
+            # Remove and re-add rather than Set: the program lives on the application filter, and
+            # one create carries every property in a single, already-tested shape.
+            Remove-NetFirewallRule -GPOSession $session -Name $d.Name -ErrorAction Stop
+            New-NetFirewallRule -GPOSession $session `
+                -Name $d.Name -DisplayName $d.DisplayName -Group $script:LolFirewallGroup `
+                -Description $d.Description -Direction Outbound -Action Block `
+                -Program $d.Program -Profile Any `
+                -Enabled $(if ($d.Enabled) { 'True' } else { 'False' }) -ErrorAction Stop | Out-Null
+        }
+        foreach ($d in $toToggle) {
+            Set-NetFirewallRule -GPOSession $session -Name $d.Name `
+                -Enabled $(if ($d.Enabled) { 'True' } else { 'False' }) -ErrorAction Stop
+        }
+        foreach ($r in $toRemove) {
+            Remove-NetFirewallRule -GPOSession $session -Name $r.Name -ErrorAction Stop
+        }
+
+        Save-NetGPO -GPOSession $session -ErrorAction Stop
+        $session = $null
+
+        # Save-NetGPO writes the policy and registers what it needs, but the machine version is
+        # what tells a client to look. Raising it again after a save that already did so costs
+        # nothing - a client seeing a higher number reprocesses, which is the intended outcome
+        # either way - and it is the one failure mode here that is completely silent.
+        Update-HardenGpoVersion -Gpo $Gpo
+
+        $result = if ($existing.Count -eq 0) { 'Created' } else { 'Updated' }
+        Write-HardenLog -Message "Firewall rules: $result - $($desired.Count) rule(s), $stateWord ($delta)" -Level Success
+        Add-HardenAction -Area 'LOLBins' -Setting 'FirewallRules' -Target $GpoName -Result $result `
+            -Detail "$($desired.Count) rule(s), $stateWord"
+        & $emitItems $result $stateWord
+
+        # Said loudly, because this is the one group where a successful-looking run can block
+        # nothing at all. Every other group at Level Audit still writes something that takes
+        # effect; a disabled rule does not, and a green Created line next to ninety of them is
+        # exactly how someone walks away believing the estate is covered.
+        if (-not $enabledWanted) {
+            Write-HardenLog -Message "Nothing is blocked yet. All $($desired.Count) rule(s) are switched off - re-run the same command with -Level Enforce to activate them." -Level Warning
+        }
+        return $result
+    }
+    catch {
+        Write-HardenLog -Message "Firewall rules failed - $($_.Exception.Message)" -Level Error
+        Add-HardenAction -Area 'LOLBins' -Setting 'FirewallRules' -Target $GpoName -Result 'Failed' `
+            -Detail $_.Exception.Message -Severity 'High'
+        & $emitItems 'Failed' 'Nothing was saved - the session was discarded. See the FirewallRules row.'
+        return 'Failed'
+    }
+    # No finally that saves. A GPO session is an in-memory staging area and nothing reaches
+    # SYSVOL until Save-NetGPO is called, so abandoning it on the error path is exactly the
+    # right behaviour - the alternative would commit a half-written rule set on the way out.
+}
+
+function Get-HardenFirewallDescription {
+    <#
+        .SYNOPSIS
+        A rule description the firewall will accept.
+
+        .DESCRIPTION
+        New-NetFirewallRule rejects some characters and over-long strings with "The description
+        contains invalid characters, or is an invalid length", which names neither the character
+        nor the length. Rather than find out per rule, everything is flattened to printable ASCII,
+        collapsed to single spaces and cut to 250.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Item,
+        [Parameter(Mandatory)][string]$Program
+    )
+
+    $text = "$Program - $($Item.Why) Managed by ADHardenKit; remove by unlinking or deleting this GPO."
+    $text = ($text -replace '[^\x20-\x7E]', ' ') -replace '\s+', ' '
+    if ($text.Length -gt 250) { $text = $text.Substring(0, 247).TrimEnd() + '...' }
+    return $text.Trim()
+}
+
 function Set-HardenGpoLink {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -2374,7 +2833,8 @@ function Invoke-HardenScan {
         [int]$Days = 30,
         [ValidateSet('Audit', 'Enforce')][string]$Level = 'Audit',
         [ValidateSet('Baseline', 'Strict')][string]$HardeningProfile = 'Baseline',
-        [string[]]$Area = @('Signing', 'LegacyAuth', 'CredentialProtection', 'Protocols', 'PolicyIntegrity', 'Logging', 'Services')
+        [string[]]$Area = @('Signing', 'LegacyAuth', 'CredentialProtection', 'Protocols', 'PolicyIntegrity', 'Logging', 'Services'),
+        [switch]$NoEventLog
     )
 
     $ctx = Get-HardenContext
@@ -2385,11 +2845,17 @@ function Invoke-HardenScan {
 
     $dcs = @(Get-ADDomainController -Filter * @ad -ErrorAction SilentlyContinue)
     Write-HardenLog -Message "$($dcs.Count) domain controller(s) in $($ctx.DomainFqdn)" -Level Info
+    if ($NoEventLog) {
+        # Declared and documented since 1.0 and never actually read until now. The two sections
+        # it covers are the only ones that touch an event log; everything else here reads the
+        # directory or the registry and stays.
+        Write-HardenLog -Message '-NoEventLog: the LDAP bind and NTLM sections are skipped. Their findings are what gate -Level Enforce, so a scan with this switch cannot clear a domain for enforcement.' -Level Warning
+    }
 
     # -- unsigned LDAP binds -------------------------------------------------------------------
     Write-HardenLog -Message 'Unsigned and unsealed LDAP binds' -Level Header
     $ldapTotal = 0
-    foreach ($dc in $dcs) {
+    foreach ($dc in $(if ($NoEventLog) { @() } else { $dcs })) {
         try {
             # Get-WinEvent throws rather than returning nothing when a filter matches no events,
             # so an empty log has to be told apart from a log that could not be read at all.
@@ -2460,7 +2926,7 @@ function Invoke-HardenScan {
     Write-HardenLog -Message 'NTLM authentication' -Level Header
     $ntlmTotal = 0
     $ntlmByEvent = @{}
-    foreach ($dc in $dcs) {
+    foreach ($dc in $(if ($NoEventLog) { @() } else { $dcs })) {
         try {
             $events = @()
             try {
@@ -2634,11 +3100,48 @@ function Invoke-HardenScan {
         Add-HardenAction -Area 'Scan' -Setting 'krbtgt-PasswordAge' -Target $ctx.DomainFqdn -Result 'Failed' -Detail $_.Exception.Message
     }
 
+    # -- LOLBins: is the firewall even on ------------------------------------------------------
+    if ('LOLBins' -in $Area) {
+        Write-HardenLog -Message 'Windows Firewall state' -Level Header
+
+        # The only thing worth reading for this group, and it is not an event log. Everything in
+        # LOLBins is a firewall rule, so a machine with the firewall switched off gets ninety
+        # rules that deploy cleanly, report as applied, and do nothing - precisely the failure
+        # mode this tool exists to catch rather than produce.
+        $fwOff = [System.Collections.Generic.List[string]]::new()
+        foreach ($dc in $dcs) {
+            try {
+                $profiles = @(Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                        Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop |
+                            Select-Object Name, Enabled
+                    } -ErrorAction Stop)
+                $off = @($profiles | Where-Object { -not $_.Enabled } | ForEach-Object { $_.Name })
+                if ($off.Count -eq 0) {
+                    Write-HardenLog -Message "$($dc.HostName): on for all profiles" -Level Success
+                    Add-HardenAction -Area 'Scan' -Setting 'Firewall-Enabled' -Target $dc.HostName -Result 'Compliant'
+                }
+                else {
+                    Write-HardenLog -Message "$($dc.HostName): OFF for $($off -join ', ')" -Level Warning
+                    Add-HardenAction -Area 'Scan' -Setting 'Firewall-Enabled' -Target $dc.HostName -Result 'Missing' `
+                        -Detail "Disabled for $($off -join ', ')" -Severity 'High'
+                    $fwOff.Add($dc.HostName)
+                }
+            }
+            catch {
+                Write-HardenLog -Message "$($dc.HostName): firewall state not readable" -Level Skip
+            }
+        }
+        if ($fwOff.Count -gt 0) {
+            $blockers.Add("The Windows Firewall is off on $($fwOff -join ', '). Every rule in the LOLBins group would deploy and do nothing there.")
+        }
+        Write-HardenLog -Message 'Member servers are not read here - the tool never connects to them. Sample one by hand if the estate is not uniform.' -Level Info
+    }
+
     # -- what is set today ---------------------------------------------------------------------
     # Scoped, because being asked about one group and answered about all seven is how a report
     # gets skimmed. The event log sections above stay unscoped on purpose - they describe the
     # domain, not a group, and their findings are what gate any later enforcement.
-    $allGroups = 'Signing', 'LegacyAuth', 'CredentialProtection', 'Protocols', 'PolicyIntegrity', 'Logging', 'Services'
+    $allGroups = 'Signing', 'LegacyAuth', 'CredentialProtection', 'Protocols', 'PolicyIntegrity', 'Logging', 'Services', 'LOLBins'
     $scoped = @($Area | Where-Object { $_ -in $allGroups })
     $header = if ($scoped.Count -lt $allGroups.Count) {
         "Current state on the domain controllers - $($scoped -join ', ')"
@@ -2836,6 +3339,7 @@ function Invoke-HardenDeployment {
             # -- security options and services share one template per GPO ----------------------
             $registryValues = @{}
             $services = @{}
+            $firewallItems = [System.Collections.Generic.List[object]]::new()
 
             foreach ($item in $applicable) {
                 switch ($item.Type) {
@@ -2871,6 +3375,18 @@ function Invoke-HardenDeployment {
                             else {
                                 Add-HardenAction -Area $group -Setting $item.Id -Target $role -Result 'Skipped' -Detail 'Declined'
                             }
+                        }
+                    }
+
+                    'FirewallRule' {
+                        # Collected rather than written one at a time: the rules share a single
+                        # GPO session, and opening one per binary would be ninety round trips to
+                        # SYSVOL for a change that belongs in one.
+                        if (Test-HardenTopicApproved -Item $item) {
+                            $firewallItems.Add($item)
+                        }
+                        else {
+                            Add-HardenAction -Area $group -Setting $item.Id -Target $role -Result 'Skipped' -Detail 'Declined'
                         }
                     }
 
@@ -2916,6 +3432,14 @@ function Invoke-HardenDeployment {
                         }
                     }
                 }
+            }
+
+            # -- firewall rules, one session for the whole group -------------------------------
+            # Deliberately outside the try that wraps the security template: a failure here is
+            # reported by the function itself and must not take the template down with it.
+            if ($firewallItems.Count -gt 0) {
+                [void](Set-HardenFirewallRules -Gpo $creation.Gpo -GpoName $gpoName -Items $firewallItems.ToArray() `
+                        -Level $Level -AuditOnly:$AuditOnly -Confirm:$false)
             }
 
             if ($registryValues.Count -gt 0 -or $services.Count -gt 0) {
@@ -3586,7 +4110,12 @@ function Confirm-HardenApply {
         }
     }
 
-    $staged = @($inScope | Where-Object { $_.Staged })
+    # Firewall rules are staged like everything else, but their audit form is "written and
+    # switched off" rather than an observing value - so they get their own line below and are
+    # kept out of the observing-form count, which would otherwise promise a watchfulness that
+    # a disabled rule does not have.
+    $fwRules = @($inScope | Where-Object { $_.Type -eq 'FirewallRule' })
+    $staged = @($inScope | Where-Object { $_.Staged -and $_.Type -ne 'FirewallRule' })
     $reboot = @($inScope | Where-Object { $_.NeedsReboot })
     $scripts = @($inScope | Where-Object { $_.Type -eq 'StartupScript' })
 
@@ -3602,6 +4131,11 @@ function Confirm-HardenApply {
     }
     elseif ($staged.Count -gt 0) {
         Write-Host "Audit - $($staged.Count) staged setting(s) deploy in observing form" -ForegroundColor Gray
+    }
+    elseif ($fwRules.Count -gt 0) {
+        # A scope that is only firewall rules has no observing values to speak of, and "deploys
+        # at its target value" would be exactly wrong - the rules deploy switched off.
+        Write-Host 'Audit - the firewall rules below are written switched off; nothing else in this scope is staged' -ForegroundColor Gray
     }
     else {
         # Saying "0 staged settings" invites the reader to wonder what they are missing.
@@ -3627,6 +4161,14 @@ function Confirm-HardenApply {
     }
     if ($scripts.Count -gt 0) {
         Write-Host ("    Scripts   {0} setting(s) deploy as a GPO startup script and need two restarts to take hold" -f $scripts.Count) -ForegroundColor DarkYellow
+    }
+    if ($fwRules.Count -gt 0) {
+        if ($Level -eq 'Enforce') {
+            Write-Host ("    Firewall  {0} outbound block rule(s) go live at the next policy refresh" -f $fwRules.Count) -ForegroundColor DarkYellow
+        }
+        else {
+            Write-Host ("    Firewall  {0} rule(s) are written switched off - nothing is blocked at this level" -f $fwRules.Count) -ForegroundColor DarkYellow
+        }
     }
 
     Write-Host ''
@@ -3700,16 +4242,20 @@ function Show-HardenMenu {
     $choice.Level = @('Audit', 'Enforce')[[int]$level - 1]
 
     # -- scope ---------------------------------------------------------------------------------
-    $allAreas = 'Logging', 'Signing', 'Protocols', 'CredentialProtection', 'LegacyAuth', 'PolicyIntegrity', 'Services'
+    $allAreas = 'Logging', 'Signing', 'Protocols', 'CredentialProtection', 'LegacyAuth', 'PolicyIntegrity', 'Services', 'LOLBins'
+    # Enter must mean the same thing here as leaving -Area off the command line, and there it
+    # means the seven standard groups. LOLBins stays a decision someone makes by name.
+    $defaultAreas = @($allAreas | Where-Object { $_ -ne 'LOLBins' })
     Write-Host ''
-    Write-Host '  Which groups? Comma-separated numbers, or Enter for all.' -ForegroundColor White
+    Write-Host '  Which groups? Comma-separated numbers, or Enter for the standard set.' -ForegroundColor White
     Write-Host '  On a domain that has never been watched, Logging alone is the right first run.' -ForegroundColor DarkGray
     for ($i = 0; $i -lt $allAreas.Count; $i++) {
-        Write-Host ('    [{0}] {1}' -f ($i + 1), $allAreas[$i]) -ForegroundColor Gray
+        $suffix = if ($allAreas[$i] -eq 'LOLBins') { '  (opt-in - not part of Enter)' } else { '' }
+        Write-Host ('    [{0}] {1}{2}' -f ($i + 1), $allAreas[$i], $suffix) -ForegroundColor Gray
     }
     while ($true) {
         $raw = (Read-Host '  Groups').Trim()
-        if ([string]::IsNullOrEmpty($raw)) { $choice.Area = $allAreas; break }
+        if ([string]::IsNullOrEmpty($raw)) { $choice.Area = $defaultAreas; break }
         $picked = [System.Collections.Generic.List[string]]::new()
         $valid = $true
         foreach ($token in ($raw -split '[,\s]+' | Where-Object { $_ })) {
@@ -3763,7 +4309,7 @@ function Show-HardenMenu {
     $cmd += " -Mode $($choice.Mode)"
     if ($choice.Contains('HardeningProfile') -and $choice.HardeningProfile -ne 'Baseline') { $cmd += " -Profile $($choice.HardeningProfile)" }
     if ($choice.Contains('Level') -and $choice.Level -ne 'Audit') { $cmd += " -Level $($choice.Level)" }
-    if ($choice.Contains('Area') -and @($choice.Area).Count -lt $allAreas.Count) { $cmd += " -Area $($choice.Area -join ',')" }
+    if ($choice.Contains('Area') -and @(Compare-Object @($choice.Area) $defaultAreas).Count -gt 0) { $cmd += " -Area $($choice.Area -join ',')" }
     if ($choice.Contains('MemberServerOu')) { $cmd += " -MemberServerOu '$($choice.MemberServerOu)'" }
     if ($choice.Contains('Interactive') -and $choice.Interactive) { $cmd += ' -Interactive' }
     if ($choice.Contains('Apply') -and $choice.Apply) { $cmd += ' -Apply' }
@@ -3898,7 +4444,7 @@ switch ($Mode) {
         if ($Interactive) {
             Write-HardenLog -Message '-Interactive only applies to Deploy mode. Scan changes nothing, so there is nothing to confirm.' -Level Info
         }
-        $blockers = @(Invoke-HardenScan -Days $ScanDays -Level $Level -Area $Area -HardeningProfile $HardeningProfile)
+        $blockers = @(Invoke-HardenScan -Days $ScanDays -Level $Level -Area $Area -HardeningProfile $HardeningProfile -NoEventLog:$NoEventLog)
         $summary = New-HardenSummary -Mode 'Scan' -Started $started -Context (Get-HardenContext) `
             -RunParameters $runParameters -Baseline (Get-HardenBaseline | Where-Object { $_.Group -in $Area }) `
             -AuditPolicy (Get-HardenAuditPolicy) -Blockers $blockers
