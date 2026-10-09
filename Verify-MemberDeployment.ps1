@@ -13,8 +13,8 @@
                                              somewhere else gets nothing and looks fine doing it
         2. did the policies arrive         - registry values, per group
         3. did the reboot-dependent ones take effect
-        4. what is NOT covered             - the per-interface NetBIOS setting reaches domain
-                                             controllers only
+        4. the startup script              - per-interface NetBIOS is set by a startup script
+                                             in the Protocols GPO, so it needs a reboot to show
 
     Read-only. Run it after gpupdate /force and a reboot.
 #>
@@ -124,18 +124,19 @@ Show 'No LLMNR, mDNS or NetBIOS listener' ($ports.Count -eq 0) $(
     if ($ports.Count) { ($ports | ForEach-Object { $_.ToString().Trim() }) -join ' | ' }
     else { 'Ports 137, 5353 and 5355 are all closed' })
 
-Write-Host "`n=== 5. Not covered by Group Policy ===" -ForegroundColor Cyan
+Write-Host "`n=== 5. Startup script ===" -ForegroundColor Cyan
 
-# The per-interface NetBIOS setting reaches domain controllers only - by design, because the
-# interface keys are named after per-machine GUIDs and no GPO can address them.
+# The interface keys are named after per-machine GUIDs, which no registry policy can address, so
+# the Protocols GPO carries a startup script for both roles. It runs at boot - after gpupdate alone
+# this check is expected to fail.
 $ifaces = @(Get-ChildItem 'HKLM:\System\CurrentControlSet\Services\NetBT\Parameters\Interfaces' -ErrorAction SilentlyContinue |
     ForEach-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).NetbiosOptions })
 $allOff = $ifaces.Count -gt 0 -and @($ifaces | Where-Object { $_ -ne 2 }).Count -eq 0
 Show "NetBIOS disabled on all $($ifaces.Count) interface(s)" $allOff $(
     if ($allOff) { 'Already done on this machine' }
-    else { "NetbiosOptions per interface: $($ifaces -join ', ') - 2 means disabled. ADHardenKit only sets this on domain controllers." })
+    else { "NetbiosOptions per interface: $($ifaces -join ', ') - 2 means disabled. The startup script runs at boot: reboot once after gpupdate. Still not 2 after a reboot means the script did not run - check gpresult for the Protocols GPO and the System log for Group Policy Scripts errors." })
 if (-not $allOff) {
-    Write-Host '      Run this here, then reboot:' -ForegroundColor Yellow
+    Write-Host '      To set it by hand instead, run this here, then reboot:' -ForegroundColor Yellow
     Write-Host "        Get-ChildItem 'HKLM:\System\CurrentControlSet\Services\NetBT\Parameters\Interfaces' | ForEach-Object { Set-ItemProperty `$_.PSPath -Name NetbiosOptions -Value 2 }" -ForegroundColor Yellow
 }
 

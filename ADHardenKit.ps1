@@ -23,7 +23,7 @@
     Guard, and an audit policy that actually records what happened.
 
     Settings are grouped by what they do, and every group becomes its own Group Policy object per
-    role - so up to twelve small GPOs rather than two large ones:
+    role - so up to sixteen small GPOs rather than two large ones:
 
         ADHardenKit-DC-Signing                  ADHardenKit-Member-Signing
         ADHardenKit-DC-LegacyAuth               ADHardenKit-Member-LegacyAuth
@@ -143,10 +143,16 @@
     assuming its name.
 
     .PARAMETER Force
-    Proceed even when Scan found evidence that enforcing would break something, and skip the
-    confirmation that an unattended -Apply otherwise asks for. Needed for a scheduled task that
+    Proceed even when the scan that precedes every -Level Enforce deployment found evidence that
+    enforcing would break something, and skip the confirmation that an unattended -Apply otherwise
+    asks for. Needed for a scheduled task that
     runs on a console-less host only if that host reports itself as interactive; otherwise the
     confirmation is skipped automatically.
+
+    .PARAMETER AllowDowngrade
+    Level Audit never lowers a staged setting that is already enforcing - in the GPO from an
+    earlier Enforce run, or on the directory server itself. This switch allows exactly that, for a
+    deliberate step back from Enforce to the observing form.
 
     .PARAMETER NoMenu
     Started without any parameters on an interactive console, the script shows a menu instead of
@@ -231,12 +237,14 @@ param(
 
     [switch]$Force,
 
+    [switch]$AllowDowngrade,
+
     [switch]$NoMenu
 )
 
 # Bumped whenever the baseline or a mechanism changes. Printed on every run and carried into the
 # report, so "which version produced this" is answerable from a pasted log rather than guessed at.
-$script:HardenKitVersion = '1.3.1'
+$script:HardenKitVersion = '1.4.0'
 
 $ErrorActionPreference = 'Stop'
 
@@ -247,9 +255,23 @@ if (-not $scriptRoot -and $MyInvocation.MyCommand.Path) { $scriptRoot = Split-Pa
 if (-not $scriptRoot) { $scriptRoot = (Get-Location).Path }
 if (-not $LogDirectory) { $LogDirectory = Join-Path $scriptRoot 'Logs' }
 if (-not $ReportDirectory) { $ReportDirectory = Join-Path $scriptRoot 'Reports' }
+$script:BackupDirectory = Join-Path $ReportDirectory 'Backups'
 
-Import-Module ActiveDirectory -ErrorAction Stop
-Import-Module GroupPolicy -ErrorAction Stop
+# A missing RSAT module is the most common first-run failure, and the raw Import-Module error
+# names neither the fix nor the tool. Said plainly instead, with the command that installs it.
+foreach ($requiredModule in 'ActiveDirectory', 'GroupPolicy') {
+    try { Import-Module $requiredModule -ErrorAction Stop }
+    catch {
+        Write-Host ''
+        Write-Host "  The $requiredModule module is not available on this machine." -ForegroundColor Red
+        Write-Host '  ADHardenKit needs the RSAT tools for Active Directory and Group Policy. Install them with:' -ForegroundColor Gray
+        Write-Host '    Windows Server:  Install-WindowsFeature RSAT-AD-PowerShell, GPMC' -ForegroundColor Cyan
+        Write-Host '    Windows 10/11:   Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0' -ForegroundColor Cyan
+        Write-Host '                     Add-WindowsCapability -Online -Name Rsat.GroupPolicy.Management.Tools~~~~0.0.1.0' -ForegroundColor Cyan
+        Write-Host ''
+        exit 3
+    }
+}
 
 $script:LogFile = $null
 $script:Actions = [System.Collections.Generic.List[object]]::new()
@@ -265,6 +287,11 @@ $script:ScopeAuditPolicy = @()
 # Every firewall rule this tool writes carries this Group, which is what makes the whole set
 # findable and removable without matching on localised display names.
 $script:LolFirewallGroup = 'ADHardenKit-LOLBins'
+# Findings of the last scan with the group each one gates - read by the Enforce gate in Deploy.
+$script:ScanFindings = [System.Collections.Generic.List[object]]::new()
+# Where earlier security templates are kept before being replaced. Set at the entry point; never
+# inside SYSVOL, where a backup file would replicate to every domain controller.
+$script:BackupDirectory = $null
 
 ####################################################################################################
 #region Core
@@ -468,6 +495,35 @@ function Test-HardenPrerequisite {
     return -not ($checks | Where-Object { -not $_.Pass })
 }
 
+function Read-HardenRegistryBatch {
+    <#
+        .SYNOPSIS
+        Reads many registry values from one machine in a single WinRM round trip.
+
+        .DESCRIPTION
+        Takes objects with Id, Path (a PowerShell registry path such as HKLM:\System\...) and
+        Name, and returns a hashtable of Id to value, $null where the value is absent. Throws when
+        the machine cannot be reached, so the caller can tell "not set" from "could not ask".
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Values
+    )
+
+    $list = @($Values | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Path = $_.Path; Name = $_.Name } })
+    $pairs = Invoke-Command -ComputerName $ComputerName -ArgumentList (, $list) -ErrorAction Stop -ScriptBlock {
+        param($items)
+        foreach ($i in $items) {
+            $v = (Get-ItemProperty -LiteralPath $i.Path -Name $i.Name -ErrorAction SilentlyContinue).($i.Name)
+            [pscustomobject]@{ Id = $i.Id; Value = $(if ($v -is [array]) { $v -join ' ' } else { $v }) }
+        }
+    }
+    $out = @{}
+    foreach ($p in @($pairs)) { $out[[string]$p.Id] = $p.Value }
+    return $out
+}
+
 #endregion Core
 
 ####################################################################################################
@@ -546,7 +602,7 @@ function Get-HardenBaseline {
         })
 
     $s.Add([ordered]@{
-            Id = 'SMB-AuditServerSigning'; MinOS = 'Server 2008 R2'; Topic = 'SMB audit'; Group = 'Signing'
+            Id = 'SMB-AuditServerSigning'; MinOS = 'Server 2016'; Topic = 'SMB audit'; Group = 'Signing'
             Name = 'Log clients that connect without signing'
             Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Baseline'; Staged = $false
             RegKey = 'HKLM\Software\Policies\Microsoft\Windows\LanmanServer'
@@ -554,8 +610,8 @@ function Get-HardenBaseline {
                 @{ Name = 'AuditClientDoesNotSupportSigning'; Type = 'DWord'; Value = 1 }
                 @{ Name = 'AuditClientDoesNotSupportEncryption'; Type = 'DWord'; Value = 1 }
             )
-            Why = 'This is the missing half of the SMB signing story. Requiring signing is the setting that can take a NAS or an appliance off the network, and until now the only way to find out in advance was a manual Set-SmbServerConfiguration on every server. There is a policy for it, and it belongs in the same GPO as the thing it observes: every client that connects to this machine without signing is written to SMBServer/Audit as event 3000, by name.'
-            Observe = 'Records only, refuses nothing - safe to deploy anywhere at any time, and the right first step before the required-signing settings in this group. The encryption half needs Server 2025 or Windows 11 and is ignored on older builds; the signing half works back to Server 2008 R2.'
+            Why = 'This is the missing half of the SMB signing story. Requiring signing is the setting that can take a NAS or an appliance off the network, and until now the only way to find out in advance was a manual Set-SmbServerConfiguration on every server. There is a policy for it, and it belongs in the same GPO as the thing it observes: every client that connects to this machine without signing is written to SMBServer/Audit as event 3021, by name.'
+            Observe = 'Records only, refuses nothing - safe to deploy anywhere at any time, and the right first step before the required-signing settings in this group. The signing half arrived with the September 2025 cumulative update (CVE-2025-55234) for Server 2016 and later - a machine without that update ignores it. The encryption half needs Server 2025 or Windows 11 24H2.'
         })
 
     $s.Add([ordered]@{
@@ -567,7 +623,7 @@ function Get-HardenBaseline {
                 @{ Name = 'AuditServerDoesNotSupportSigning'; Type = 'DWord'; Value = 1 }
                 @{ Name = 'AuditServerDoesNotSupportEncryption'; Type = 'DWord'; Value = 1 }
             )
-            Why = 'The outbound direction. Every server this machine connected to that could not sign lands in SMBClient/Connectivity as event 31998 - which is how a backup job pointed at an old appliance is found before, rather than after, client signing is required.'
+            Why = 'The outbound direction. Every server this machine connected to that could not sign lands in SMBClient/Audit as event 31998 - which is how a backup job pointed at an old appliance is found before, rather than after, client signing is required.'
         })
 
     $s.Add([ordered]@{
@@ -591,7 +647,7 @@ function Get-HardenBaseline {
             # Level Audit; the observation happens in the SMBServer audit log instead.
             ValueType = 4; AuditValue = $null; EnforceValue = 1
             Why = 'Without server-side signing an SMB session can be relayed. Domain controllers require it by default; member servers usually do not.'
-            Observe = 'The observation form is a separate policy, deployed by the SMB audit topic in this same group: it logs every client that connected without signing, to SMBServer/Audit event 3000. Deploy that, read the log for a cycle, then come back here. Old NAS devices and appliances are the usual casualties.'
+            Observe = 'The observation form is a separate policy, deployed by the SMB audit topic in this same group: it logs every client that connected without signing, to SMBServer/Audit event 3021. Deploy that, read the log for a cycle, then come back here. Old NAS devices and appliances are the usual casualties.'
         })
 
     $s.Add([ordered]@{
@@ -601,7 +657,7 @@ function Get-HardenBaseline {
             # Same reasoning as the server side: absent rather than zero.
             ValueType = 4; AuditValue = $null; EnforceValue = 1
             Why = 'Stops the server from talking to a file server that will not sign - which is also how it breaks a backup job pointed at an old appliance.'
-            Observe = 'The observation form is a separate policy, deployed by the SMB audit topic in this same group - it records every server this machine reached that could not sign, to SMBClient/Connectivity event 31998. A backup job pointed at an old appliance is the classic find.'
+            Observe = 'The observation form is a separate policy, deployed by the SMB audit topic in this same group - it records every server this machine reached that could not sign, to SMBClient/Audit event 31998. A backup job pointed at an old appliance is the classic find.'
         })
 
     $s.Add([ordered]@{
@@ -644,7 +700,7 @@ function Get-HardenBaseline {
             Key = 'MACHINE\System\CurrentControlSet\Control\Lsa\MSV1_0\AuditReceivingNTLMTraffic'
             ValueType = 4; EnforceValue = 2
             Why = 'Pure observation, no enforcement. Writes every incoming NTLM authentication to the NTLM operational log so you can find out who still needs it.'
-            Observe = 'Applications and Services > Microsoft > Windows > NTLM > Operational, event 8004.'
+            Observe = 'Applications and Services > Microsoft > Windows > NTLM > Operational, event 8002 on the machine that received the authentication.'
         })
 
     $s.Add([ordered]@{
@@ -697,14 +753,12 @@ function Get-HardenBaseline {
             Observe = 'Changing this does not take effect until the password changes: the keys are derived from the cleartext password when it is set, so an account whose password predates the change still only has the old key material. Plan a password rotation for service accounts alongside it, and note that an account left with only RC4 keys cannot obtain a ticket at all once RC4 is disallowed. Windows also translates the registry value back when it writes msDS-SupportedEncryptionTypes into the directory, so 0x7FFFFFF8 on the machine shows up as 0x18 on the object - that is expected. Scan lists accounts whose msDS-SupportedEncryptionTypes still allows RC4. Note that this is only the member-side policy; since the January 2026 update the KDC side is governed by DefaultDomainSupportedEncTypes, which now defaults to 0x18, and RC4DefaultDisablementPhase stopped being read with the July 2026 updates.'
         })
 
-    $s.Add([ordered]@{
-            Id = 'Kdc-StrongCertificateBinding'; Topic = 'Certificate binding for Kerberos'; Reference = 'KB5014754, CVE-2022-26931, CVE-2022-26923'; Group = 'LegacyAuth'; Name = 'Strong certificate binding for Kerberos'
-            Type = 'SecurityOption'; Target = 'DC'; Profile = 'Baseline'; Staged = $true
-            Key = 'MACHINE\System\CurrentControlSet\Services\Kdc\StrongCertificateBindingEnforcement'
-            ValueType = 4; AuditValue = 1; EnforceValue = 2
-            Why = 'Weak certificate mapping lets a certificate be bound to the wrong account. Value 1 is compatibility mode with logging, 2 is full enforcement.'
-            Observe = 'System log on the domain controllers, events 39, 40 and 41 name certificates with a weak mapping.'
-        })
+    # Strong certificate binding on the KDC (StrongCertificateBindingEnforcement) was a staged
+    # setting here up to 1.3.1. Full enforcement became the default with the February 2025 update
+    # and the registry value stopped being read with the September 2025 update (KB5014754), so
+    # there is nothing left to stage. Scan now reads KDC events 39, 40 and 41 instead - after
+    # enforcement those are not warnings but certificate logons that already fail.
+
 
     # -- Credential exposure --------------------------------------------------------------------
     $s.Add([ordered]@{
@@ -713,7 +767,7 @@ function Get-HardenBaseline {
             Key = 'MACHINE\System\CurrentControlSet\Control\Lsa\RunAsPPL'
             ValueType = 4; EnforceValue = 1
             Why = 'Runs LSASS as a protected process so ordinary credential dumping fails. This is the domain controller equivalent of Credential Guard, which is not appropriate on a DC.'
-            Observe = 'Requires a reboot. A driver or security agent that hooks LSASS may stop loading - check the System log for event 3033 or 3063 afterwards.'
+            Observe = 'Requires a reboot. A driver or security agent that hooks LSASS may stop loading - check the System log for event 3033 or 3063 afterwards. On a machine with Secure Boot, value 1 also writes a UEFI variable: removing the registry value no longer turns protection off, that takes the LSA Protected Process opt-out tool. Test on one server first.'
         })
 
     $s.Add([ordered]@{
@@ -766,10 +820,16 @@ function Get-HardenBaseline {
             Values = @(
                 @{ Name = 'EnableVirtualizationBasedSecurity'; Type = 'DWord'; Value = 1 }
                 @{ Name = 'RequirePlatformSecurityFeatures'; Type = 'DWord'; Value = 1 }
-                @{ Name = 'LsaCfg'; Type = 'DWord'; Value = 1 }
+                # LsaCfgFlags, not LsaCfg: that is the value name the DeviceGuard ADMX writes and
+                # the one Windows reads. Up to 1.3.1 this said LsaCfg, which turned VBS on and left
+                # Credential Guard off while the run reported the topic as deployed.
+                # 2 = enabled without UEFI lock, so the setting can still be withdrawn through
+                # Group Policy. 1 would add the UEFI lock, which survives unlinking the GPO and
+                # needs a physical visit to undo - the wrong default for a server estate.
+                @{ Name = 'LsaCfgFlags'; Type = 'DWord'; Value = 2 }
             )
             Why = 'Isolates NTLM hashes and Kerberos tickets from LSASS so credential dumping returns nothing useful. Member servers only - Microsoft documents that it adds no security on a domain controller and can cause compatibility problems there.'
-            Observe = 'Needs virtualisation support and Secure Boot. Verify afterwards with Get-CimInstance Win32_DeviceGuard.'
+            Observe = 'Needs virtualisation support and Secure Boot. Deployed without UEFI lock, so unlinking the GPO and rebooting takes it away again. Verify afterwards with Get-CimInstance Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard - SecurityServicesRunning contains 1 when Credential Guard is running.'
         })
 
     $s.Add([ordered]@{
@@ -841,7 +901,7 @@ function Get-HardenBaseline {
         })
 
     $s.Add([ordered]@{
-            Id = 'SMB-MinDialectServer'; MinOS = 'Server 2022'; Topic = 'SMB dialect'; Group = 'Protocols'
+            Id = 'SMB-MinDialectServer'; MinOS = 'Server 2025'; Topic = 'SMB dialect'; Group = 'Protocols'
             Name = 'Server refuses anything below SMB 3.0'
             Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Strict'; Staged = $false
             RegKey = 'HKLM\Software\Policies\Microsoft\Windows\LanmanServer'
@@ -851,7 +911,7 @@ function Get-HardenBaseline {
         })
 
     $s.Add([ordered]@{
-            Id = 'SMB-MinDialectClient'; MinOS = 'Server 2022'; Topic = 'SMB dialect'; Group = 'Protocols'
+            Id = 'SMB-MinDialectClient'; MinOS = 'Server 2025'; Topic = 'SMB dialect'; Group = 'Protocols'
             Name = 'Client refuses anything below SMB 3.0'
             Type = 'AdminTemplate'; Target = 'Both'; Profile = 'Strict'; Staged = $false
             RegKey = 'HKLM\Software\Policies\Microsoft\Windows\LanmanWorkstation'
@@ -1011,13 +1071,13 @@ function Get-HardenBaseline {
     # -- The Schannel half of the certificate binding story -------------------------------------
     $s.Add([ordered]@{
             Id = 'Schannel-CertificateMapping'; DefaultWhenUnset = 24
-            Topic = 'Certificate binding for Kerberos'; Group = 'LegacyAuth'
+            Topic = 'Certificate mapping'; Group = 'LegacyAuth'
             Reference = 'KB5014754, CVE-2022-26931, CVE-2022-26923'
             Name = 'Strong certificate mapping for Schannel'
             Type = 'SecurityOption'; Target = 'DC'; Profile = 'Baseline'; Staged = $false
             Key = 'MACHINE\System\CurrentControlSet\Control\SecurityProviders\Schannel\CertificateMappingMethods'
             ValueType = 4; EnforceValue = 24
-            Why = 'The companion to strong certificate binding on the KDC, which covers Kerberos only. This is the Schannel side, and 0x18 leaves just the two strong mapping methods - S4U2Self and its explicit form - with subject, issuer and UPN mapping switched off. Those three can be spoofed by anyone able to request a certificate with a chosen subject.'
+            Why = 'The Schannel counterpart of strong certificate binding, which the KDC now enforces by itself. This is the side that still has a registry value, and 0x18 leaves just the two strong mapping methods - S4U2Self and its explicit form - with subject, issuer and UPN mapping switched off. Those three can be spoofed by anyone able to request a certificate with a chosen subject.'
             Observe = 'Already the default since KB5014754, so this normally changes nothing. It is here because the value that gets set back to 0x1F to work around a certificate problem is the one nobody remembers to undo, and nothing in the directory reports it.'
         })
 
@@ -1185,7 +1245,7 @@ function Get-HardenBaseline {
             # until Level Enforce.
             ValueType = 4; AuditValue = $null; EnforceValue = 2
             Why = 'The inbound counterpart to denying outgoing NTLM. 2 refuses every incoming NTLM authentication, which is the end state but rarely the starting one.'
-            Observe = 'NTLM operational log event 8004 on this machine lists what would be refused. Turn the auditing on and read it before setting this.'
+            Observe = 'NTLM operational log event 8002 on this machine lists what would be refused. Turn the auditing on and read it before setting this.'
         })
 
     $s.Add([ordered]@{
@@ -1488,7 +1548,7 @@ function Get-HardenAuditPolicy {
 
     # Subcategory, GUID, DC value, Member value, why.
     # The leading comma on every row is load-bearing: @() flattens nested arrays, so without
-    # it this becomes 125 loose strings rather than 25 rows of five.
+    # it this becomes loose strings rather than rows of five.
     $rows = @(
         , @('Credential Validation', '{0CCE923F-69AE-11D9-BED3-505054503030}', 3, 3, 'Every NTLM authentication attempt against the domain, success and failure.')
         , @('Kerberos Authentication Service', '{0CCE9242-69AE-11D9-BED3-505054503030}', 3, 0, 'TGT requests. Failures here are password spraying.')
@@ -1577,7 +1637,6 @@ function Get-HardenLolBinCatalog {
     $net4x = '%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319'
     $net2 = '%SystemRoot%\Microsoft.NET\Framework\v2.0.50727'
     $net2x = '%SystemRoot%\Microsoft.NET\Framework64\v2.0.50727'
-    $win = '%SystemRoot%'
 
     # The leading comma on every row is load-bearing, exactly as in the audit policy above:
     # without it @() flattens each row into loose values.
@@ -1887,11 +1946,14 @@ function Request-HardenTopicDecision {
     }
 
     # Rows first, so a topic where nothing would change at this level is not asked about at all.
+    # "now" is read on the directory server. For a setting that only ever lands on member
+    # servers that value says nothing about them - a DC without Credential Guard is the intended
+    # state - so it is not shown as if it were theirs.
     $rows = foreach ($item in $Items) {
         [pscustomobject]@{
             Item    = $item
             Target  = Get-HardenTargetLabel -Item $item -Level $Level
-            Current = Get-HardenLiveValue -Item $item
+            Current = if ($item.Target -eq 'Member' -and $item.Type -ne 'FirewallRule') { 'member only' } else { Get-HardenLiveValue -Item $item }
         }
     }
     $active = @($rows | Where-Object { $null -ne $_.Target })
@@ -1911,7 +1973,7 @@ function Request-HardenTopicDecision {
     Write-Host $risk -ForegroundColor $riskColour -NoNewline
     Write-Host ']' -ForegroundColor DarkGray
     $roleLabel = if ($Role -eq 'DC') { 'domain controllers' } else { 'member servers' }
-    Write-Host ("       {0}  ->  {1}" -f $roleLabel, $GpoName) -ForegroundColor DarkGray
+    Write-Host ("       {0}  ->  {1}   ('now' read on {2})" -f $roleLabel, $GpoName, (Get-HardenContext).Server) -ForegroundColor DarkGray
     Write-Host ''
 
     # Column width is a floor, not a ceiling: -f pads a short value but never truncates a long one,
@@ -1962,14 +2024,14 @@ function Request-HardenTopicDecision {
             Write-Host ("{0,-$currentWidth} " -f $row.Current) -ForegroundColor White -NoNewline
             Write-Host '-> ' -ForegroundColor DarkGray -NoNewline
             Write-Host $row.Target -ForegroundColor Cyan -NoNewline
-            # An der Zeile, nicht im Fliesstext: eine Einstellung, die auf dieser Maschine gar
-            # nicht gelesen wird, sieht sonst aus wie jede andere Aenderung.
+            # On the row rather than in the text: a setting this machine does not even read would
+            # otherwise look like any other change.
             if ($row.Item.MinOS) { Write-Host "  [$($row.Item.MinOS)+]" -ForegroundColor DarkYellow } else { Write-Host '' }
         }
     }
 
-    # Eine Zeile pro Thema statt pro Einstellung: bei fuenf SMB-Werten mit derselben
-    # Mindestversion ist die Wiederholung Laerm, die Aussage aber wichtig.
+    # One line per topic rather than per setting: five SMB values with the same minimum version
+    # repeat noise, but the statement itself matters.
     # Sorted by release, not alphabetically, and only the highest requirement is named: a topic
     # where one setting needs 2008 R2 and another needs 2025 is a 2025 topic for anyone deciding
     # whether it will do anything, and listing both reads as a choice between them.
@@ -2129,6 +2191,25 @@ function Get-HardenGpoPath {
     return Join-Path $ctx.SysvolPolicyPath ("{" + $GpoId.ToString().ToUpper() + "}")
 }
 
+function Get-HardenTemplateValue {
+    <#
+        .SYNOPSIS
+        The [Registry Values] of a GPO's security template, as upper-cased key -> value text.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Gpo)
+
+    $out = @{}
+    $inf = Join-Path (Get-HardenGpoPath -GpoId $Gpo.Id) 'Machine\Microsoft\Windows NT\SecEdit\GptTmpl.inf'
+    if (-not (Test-Path -LiteralPath $inf)) { return $out }
+    $text = Get-Content -LiteralPath $inf -Raw -Encoding Unicode -ErrorAction SilentlyContinue
+    if (-not $text) { return $out }
+    foreach ($m in [regex]::Matches($text, '(?im)^\s*(MACHINE\\[^=\r\n]+?)\s*=\s*\d+\s*,\s*(.*?)\s*$')) {
+        $out[$m.Groups[1].Value.Trim().ToUpperInvariant()] = $m.Groups[2].Value.Trim('"')
+    }
+    return $out
+}
+
 function Set-HardenSecurityTemplate {
     <#
         .SYNOPSIS
@@ -2189,8 +2270,13 @@ function Set-HardenSecurityTemplate {
     if (-not (Test-Path -LiteralPath $secDir)) {
         New-Item -Path $secDir -ItemType Directory -Force | Out-Null
     }
-    if (Test-Path -LiteralPath $tmplPath) {
-        Copy-Item -LiteralPath $tmplPath -Destination "$tmplPath.bak-$(Get-Date -Format 'yyyyMMddHHmmss')" -Force
+    if ((Test-Path -LiteralPath $tmplPath) -and $script:BackupDirectory) {
+        # Outside SYSVOL: a .bak next to the template replicates to every DC and lingers there.
+        if (-not (Test-Path -LiteralPath $script:BackupDirectory)) {
+            New-Item -Path $script:BackupDirectory -ItemType Directory -Force -WhatIf:$false -Confirm:$false | Out-Null
+        }
+        $backupName = '{0}-GptTmpl-{1}.inf' -f ($Gpo.DisplayName -replace '[\\/:*?"<>|]', '_'), (Get-Date -Format 'yyyyMMddHHmmss')
+        Copy-Item -LiteralPath $tmplPath -Destination (Join-Path $script:BackupDirectory $backupName) -Force -WhatIf:$false -Confirm:$false
     }
 
     # secedit reads UTF-16 and nothing else.
@@ -2789,11 +2875,64 @@ function Get-HardenFirewallDescription {
     return $text.Trim()
 }
 
+function Get-HardenLinkConflict {
+    <#
+        .SYNOPSIS
+        Finds GPOs that outrank this one on the same OU and set the same security options.
+
+        .DESCRIPTION
+        A link that New-GPLink creates without -Order goes to the end of the list, which is the
+        lowest precedence. On the Domain Controllers OU that puts it behind the Default Domain
+        Controllers Policy - and that policy commonly carries the same security options this tool
+        writes, LDAP server signing and SMB server signing among them. Where two GPOs on one OU set
+        the same value, the higher-precedence one wins on the client, so an Enforce run would write
+        2 into its GPO, report it as deployed, and the domain controllers would go on applying 1.
+
+        Only the security template is compared, because that is where the overlap happens: the
+        Default Domain Controllers Policy carries no administrative templates by default.
+        Enforced links inherited from a parent container outrank everything regardless and are
+        reported separately by the caller's own log line, not resolved here.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$GpoName,
+        [Parameter(Mandatory)][string]$TargetDn,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Keys
+    )
+
+    if ($Keys.Count -eq 0) { return @() }
+    $ctx = Get-HardenContext
+    $inheritance = Get-GPInheritance -Target $TargetDn -Domain $ctx.DomainFqdn -Server $ctx.Server -ErrorAction Stop
+    $links = @($inheritance.GpoLinks)
+    $ours = $links | Where-Object { $_.DisplayName -eq $GpoName } | Select-Object -First 1
+    $ourOrder = if ($ours) { [int]$ours.Order } else { [int]::MaxValue }
+
+    $wanted = @{}
+    foreach ($k in $Keys) { $wanted[$k.ToUpperInvariant()] = $true }
+
+    $conflicts = foreach ($l in ($links | Where-Object { $_.Enabled -and [int]$_.Order -lt $ourOrder -and $_.DisplayName -ne $GpoName })) {
+        $inf = Join-Path (Get-HardenGpoPath -GpoId $l.GpoId) 'Machine\Microsoft\Windows NT\SecEdit\GptTmpl.inf'
+        if (-not (Test-Path -LiteralPath $inf)) { continue }
+        $text = Get-Content -LiteralPath $inf -Raw -ErrorAction SilentlyContinue
+        if (-not $text) { continue }
+        $hit = @([regex]::Matches($text, '(?im)^\s*(MACHINE\\[^=\r\n]+?)\s*=') |
+                ForEach-Object { $_.Groups[1].Value.Trim() } |
+                Where-Object { $wanted.ContainsKey($_.ToUpperInvariant()) })
+        if ($hit.Count -gt 0) {
+            [pscustomobject]@{ Gpo = $l.DisplayName; Order = [int]$l.Order; Keys = $hit }
+        }
+    }
+    return @($conflicts)
+}
+
 function Set-HardenGpoLink {
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)][string]$GpoName,
         [Parameter(Mandatory)][string]$TargetDn,
+        # Set when a higher-precedence GPO on the same OU sets the same values. The link is then
+        # created at, or moved to, position 1 so this GPO wins - the whole point of deploying it.
+        [switch]$TakePrecedence,
         [switch]$AuditOnly
     )
 
@@ -2801,15 +2940,18 @@ function Set-HardenGpoLink {
     $inheritance = Get-GPInheritance -Target $TargetDn -Domain $ctx.DomainFqdn -Server $ctx.Server -ErrorAction Stop
     $link = $inheritance.GpoLinks | Where-Object { $_.DisplayName -eq $GpoName }
 
-    if ($link -and $link.Enabled) { return 'Compliant' }
+    $orderOk = -not $TakePrecedence -or ($link -and [int]$link.Order -eq 1)
+    if ($link -and $link.Enabled -and $orderOk) { return 'Compliant' }
     if ($AuditOnly) { return $(if ($link) { 'Drift' } else { 'Missing' }) }
 
-    if ($PSCmdlet.ShouldProcess("$GpoName -> $TargetDn", 'Link GPO')) {
+    if ($PSCmdlet.ShouldProcess("$GpoName -> $TargetDn", $(if ($TakePrecedence) { 'Link GPO at position 1' } else { 'Link GPO' }))) {
+        $orderParam = @{}
+        if ($TakePrecedence) { $orderParam['Order'] = 1 }
         if ($link) {
-            Set-GPLink -Name $GpoName -Target $TargetDn -LinkEnabled Yes -Domain $ctx.DomainFqdn -Server $ctx.Server -ErrorAction Stop | Out-Null
+            Set-GPLink -Name $GpoName -Target $TargetDn -LinkEnabled Yes @orderParam -Domain $ctx.DomainFqdn -Server $ctx.Server -ErrorAction Stop | Out-Null
             return 'Updated'
         }
-        New-GPLink -Name $GpoName -Target $TargetDn -LinkEnabled Yes -Domain $ctx.DomainFqdn -Server $ctx.Server -ErrorAction Stop | Out-Null
+        New-GPLink -Name $GpoName -Target $TargetDn -LinkEnabled Yes @orderParam -Domain $ctx.DomainFqdn -Server $ctx.Server -ErrorAction Stop | Out-Null
         return 'Created'
     }
     return 'Planned'
@@ -2853,52 +2995,80 @@ function Invoke-HardenScan {
     $ad = Get-HardenAdParameter
     $blockers = [System.Collections.Generic.List[string]]::new()
 
+    # Every finding also carries the group it gates, so a Deploy run at Level Enforce can stop on
+    # the findings that concern the groups it is about to enforce - and not on a krbtgt password
+    # age that has nothing to do with LDAP signing. $null means informational: reported, never a
+    # reason to refuse a deployment.
+    $script:ScanFindings = [System.Collections.Generic.List[object]]::new()
+    $addFinding = {
+        param([AllowNull()][string]$Group, [string]$Text)
+        $blockers.Add($Text)
+        $script:ScanFindings.Add([pscustomobject]@{ Group = $Group; Text = $Text })
+    }
+
     Write-HardenLog -Message "Scan over the last $Days day(s)" -Level Header
 
     $dcs = @(Get-ADDomainController -Filter * @ad -ErrorAction SilentlyContinue)
     Write-HardenLog -Message "$($dcs.Count) domain controller(s) in $($ctx.DomainFqdn)" -Level Info
     if ($NoEventLog) {
-        # Declared and documented since 1.0 and never actually read until now. The two sections
-        # it covers are the only ones that touch an event log; everything else here reads the
+        # Declared and documented since 1.0 and never actually read until 1.3.0. The sections it
+        # covers are the only ones that touch an event log; everything else here reads the
         # directory or the registry and stays.
-        Write-HardenLog -Message '-NoEventLog: the LDAP bind and NTLM sections are skipped. Their findings are what gate -Level Enforce, so a scan with this switch cannot clear a domain for enforcement.' -Level Warning
+        Write-HardenLog -Message '-NoEventLog: the LDAP bind, NTLM and certificate mapping sections are skipped. Their findings are what gate -Level Enforce, so a scan with this switch cannot clear a domain for enforcement.' -Level Warning
     }
 
+    $since = (Get-Date).AddDays(-$Days)
+
     # -- unsigned LDAP binds -------------------------------------------------------------------
+    # Read and summarised ON the domain controller, over WinRM like everything else here. Up to
+    # 1.3.1 this pulled every event across with Get-WinEvent -ComputerName, which is a second
+    # transport (RPC, the Remote Event Log Management firewall rule), renders every message on
+    # the way and, on a busy DC, moves tens of thousands of records to throw most of them away.
+    #
+    # The event is read by property, not by message text: Properties[0] is the client address
+    # with its port, [1] the identity it bound as. The message is localised; the properties are
+    # not, so this reads the same on a German or French domain controller.
     Write-HardenLog -Message 'Unsigned and unsealed LDAP binds' -Level Header
     $ldapTotal = 0
     foreach ($dc in $(if ($NoEventLog) { @() } else { $dcs })) {
         try {
-            # Get-WinEvent throws rather than returning nothing when a filter matches no events,
-            # so an empty log has to be told apart from a log that could not be read at all.
-            # Reporting "not readable" for a clean DC would be exactly the wrong way round.
-            $events = @()
-            try {
-                $events = @(Get-WinEvent -ComputerName $dc.HostName -FilterHashtable @{
-                        LogName = 'Directory Service'; Id = 2889; StartTime = (Get-Date).AddDays(-$Days)
-                    } -ErrorAction Stop)
+            $res = Invoke-Command -ComputerName $dc.HostName -ArgumentList $since -ErrorAction Stop -ScriptBlock {
+                param($start)
+                $events = @()
+                try {
+                    $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Directory Service'; Id = 2889; StartTime = $start } -ErrorAction Stop)
+                }
+                catch {
+                    # The "no events" condition is recognised by its error id. Its message is
+                    # localised, and matching the English text turned every clean German DC
+                    # into "log not readable".
+                    if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { throw }
+                }
+                $clients = @($events | ForEach-Object {
+                        $ip = "$($_.Properties[0].Value)" -replace ':\d+$', ''
+                        $who = "$($_.Properties[1].Value)"
+                        if ($who) { "$who from $ip" } else { $ip }
+                    })
+                [pscustomobject]@{
+                    Count    = $events.Count
+                    Distinct = @($events | ForEach-Object { "$($_.Properties[0].Value)" -replace ':\d+$', '' } | Sort-Object -Unique).Count
+                    Top      = @($clients | Group-Object | Sort-Object Count -Descending | Select-Object -First 10 |
+                            ForEach-Object { [pscustomobject]@{ Name = $_.Name; Count = $_.Count } })
+                }
             }
-            catch [System.Exception] {
-                if ($_.Exception.Message -notmatch 'No events were found') { throw }
-            }
-            $ldapTotal += $events.Count
+            $ldapTotal += [int]$res.Count
 
-            if ($events.Count -eq 0) {
+            if ([int]$res.Count -eq 0) {
                 Write-HardenLog -Message "$($dc.HostName): none" -Level Success
                 continue
             }
 
-            # Event 2889 carries the client address and the account in the message body.
-            $clients = $events | ForEach-Object {
-                ($_.Message -split "`n" | Where-Object { $_ -match ':\s*\d+\.\d+\.\d+\.\d+' } | Select-Object -First 1)
-            } | Where-Object { $_ } | ForEach-Object { $_.Trim() }
-
-            Write-HardenLog -Message "$($dc.HostName): $($events.Count) unsigned bind(s) from $((@($clients | Sort-Object -Unique)).Count) client(s)" -Level Warning
-            foreach ($c in ($clients | Group-Object | Sort-Object Count -Descending | Select-Object -First 10)) {
+            Write-HardenLog -Message "$($dc.HostName): $($res.Count) unsigned bind(s) from $($res.Distinct) client address(es)" -Level Warning
+            foreach ($c in @($res.Top)) {
                 Write-HardenLog -Message "    $($c.Count)x  $($c.Name)" -Level Info
             }
             Add-HardenAction -Area 'Scan' -Setting 'LDAP-ServerSigning' -Target $dc.HostName -Result 'Observed' `
-                -Detail "$($events.Count) unsigned binds in $Days days" -Severity 'High'
+                -Detail "$($res.Count) unsigned binds in $Days days" -Severity 'High'
         }
         catch {
             Write-HardenLog -Message "$($dc.HostName): log not readable - $($_.Exception.Message)" -Level Warning
@@ -2907,7 +3077,7 @@ function Invoke-HardenScan {
     }
 
     if ($ldapTotal -gt 0) {
-        $blockers.Add("LDAP signing: $ldapTotal unsigned bind(s) recorded. Enforcing now would break those clients.")
+        & $addFinding 'Signing' "LDAP signing: $ldapTotal unsigned bind(s) recorded. Enforcing now would break those clients."
     }
     else {
         Write-HardenLog -Message 'No unsigned binds recorded. Note that this only counts if event 2889 logging was already on - see LDAP diagnostics below.' -Level Info
@@ -2926,7 +3096,7 @@ function Invoke-HardenScan {
             }
             else {
                 Write-HardenLog -Message "$($dc.HostName): diagnostics level $(if ($null -eq $val) { 0 } else { $val }) - event 2889 is NOT being written, so an empty result above means nothing" -Level Warning
-                $blockers.Add("$($dc.HostName): LDAP interface diagnostics off, so the clean LDAP result above is meaningless. Deploy it with -Mode Deploy -Area Logging -Apply, which enforces nothing, then leave it running for a full business cycle including month-end before trusting the count.")
+                & $addFinding 'Signing' "$($dc.HostName): LDAP interface diagnostics off, so the clean LDAP result above is meaningless. Deploy it with -Mode Deploy -Area Logging -Apply, which enforces nothing, then leave it running for a full business cycle including month-end before trusting the count."
             }
         }
         catch {
@@ -2935,35 +3105,61 @@ function Invoke-HardenScan {
     }
 
     # -- NTLM usage ----------------------------------------------------------------------------
+    # Same shape as the LDAP section: counted and summarised on the DC, one WinRM round trip per
+    # DC, names taken from the event's named data fields rather than its localised message.
     Write-HardenLog -Message 'NTLM authentication' -Level Header
     $ntlmTotal = 0
     $ntlmByEvent = @{}
     foreach ($dc in $(if ($NoEventLog) { @() } else { $dcs })) {
         try {
-            $events = @()
-            try {
-                $events = @(Get-WinEvent -ComputerName $dc.HostName -FilterHashtable @{
-                        LogName = 'Microsoft-Windows-NTLM/Operational'; StartTime = (Get-Date).AddDays(-$Days)
-                    } -ErrorAction Stop)
+            $res = Invoke-Command -ComputerName $dc.HostName -ArgumentList $since -ErrorAction Stop -ScriptBlock {
+                param($start)
+                $events = @()
+                try {
+                    $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-NTLM/Operational'; StartTime = $start } -ErrorAction Stop)
+                }
+                catch {
+                    if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { throw }
+                }
+                # Named EventData fields are the same in every language. The XML is parsed for a
+                # bounded sample only - the counts above cover every event, the names are a
+                # worklist and do not need all fifty thousand of them.
+                $names = foreach ($e in ($events | Select-Object -First 5000)) {
+                    try {
+                        $x = [xml]$e.ToXml()
+                        foreach ($d in @($x.Event.EventData.Data)) {
+                            if ($d.Name -match '^(UserName|WorkstationName|SChannelName|DomainName|ClientUserName|ClientDomainName|ClientWorkstationName|TargetName|CallerPID|ProcessName)$' -and
+                                "$($d.'#text')".Trim() -and "$($d.'#text')" -ne '-') {
+                                "$($d.Name): $($d.'#text')"
+                            }
+                        }
+                    }
+                    catch { }
+                }
+                [pscustomobject]@{
+                    Count   = $events.Count
+                    ByEvent = @($events | Group-Object Id | ForEach-Object { [pscustomobject]@{ Id = [int]$_.Name; Count = $_.Count } })
+                    Top     = @($names | Group-Object | Sort-Object Count -Descending | Select-Object -First 8 |
+                            ForEach-Object { [pscustomobject]@{ Name = $_.Name; Count = $_.Count } })
+                }
             }
-            catch [System.Exception] {
-                if ($_.Exception.Message -notmatch 'No events were found') { throw }
-            }
+
+            $count = [int]$res.Count
             # Not $level: this function has a -Level parameter with a ValidateSet, and assigning
             # a log severity to it fails validation at runtime. PowerShell variable names are case
             # insensitive, so $level and $Level are the same variable.
-            $logLevel = if ($events.Count -gt 0) { 'Warning' } else { 'Info' }
-            Write-HardenLog -Message "$($dc.HostName): $($events.Count) NTLM event(s)" -Level $logLevel
+            $logLevel = if ($count -gt 0) { 'Warning' } else { 'Info' }
+            Write-HardenLog -Message "$($dc.HostName): $count NTLM event(s)" -Level $logLevel
 
-            if ($events.Count -gt 0) {
+            if ($count -gt 0) {
                 # A bare count says nothing about what would break, and the directions are easy
                 # to get backwards - this classification follows the Microsoft assessment guide:
                 # 8001 is written on the machine that went OUT with NTLM, 8002 on the machine
                 # that RECEIVED it, 8003/8004 are the domain-wide audit as seen by a member and
                 # the DC respectively. The 40xx series is the Server 2025 / Win11 24H2 enhanced
                 # auditing (KB5064479) - richer detail, same story.
-                foreach ($g in ($events | Group-Object Id | Sort-Object Count -Descending)) {
-                    $id = [int]$g.Name
+                foreach ($g in (@($res.ByEvent) | Sort-Object Count -Descending)) {
+                    $id = [int]$g.Id
                     $meaning = switch ($id) {
                         8001 { 'outgoing NTLM from this machine' }
                         8002 { 'incoming NTLM to this machine' }
@@ -2983,28 +3179,22 @@ function Invoke-HardenScan {
                         }
                     }
                     if (-not $ntlmByEvent.ContainsKey($id)) { $ntlmByEvent[$id] = 0 }
-                    $ntlmByEvent[$id] = $ntlmByEvent[$id] + $g.Count
-                    Write-HardenLog -Message "    $($g.Count)x  event $($g.Name) - $meaning" -Level Info
+                    $ntlmByEvent[$id] = $ntlmByEvent[$id] + [int]$g.Count
+                    Write-HardenLog -Message "    $($g.Count)x  event $id - $meaning" -Level Info
                 }
 
-                # The account and workstation names sit in the message body. Pulling the most
-                # frequent ones out is the difference between "91 events" and a name to call.
-                $names = $events | ForEach-Object {
-                    $_.Message -split "`n" | Where-Object { $_ -match '^\s*(User Name|Workstation Name|Secure Channel Name|Domain Name)\s*:' }
-                } | Where-Object { $_ } | ForEach-Object { $_.Trim() }
-
-                foreach ($n in ($names | Group-Object | Sort-Object Count -Descending | Select-Object -First 8)) {
+                # The difference between "91 events" and a name to call.
+                foreach ($n in @($res.Top)) {
                     Write-HardenLog -Message "    $($n.Count)x  $($n.Name)" -Level Info
                 }
 
                 Add-HardenAction -Area 'Scan' -Setting 'NTLM-Usage' -Target $dc.HostName -Result 'Observed' `
-                    -Detail "$($events.Count) NTLM events in $Days days" -Severity 'High'
+                    -Detail "$count NTLM events in $Days days" -Severity 'High'
             }
 
             # Counted last, so a failure part way through does not leave a total that the
-            # per-event breakdown cannot account for - which reads as "events with no direction"
-            # and sends someone looking in the wrong place.
-            $ntlmTotal += $events.Count
+            # per-event breakdown cannot account for.
+            $ntlmTotal += $count
         }
         catch {
             Write-HardenLog -Message "$($dc.HostName): NTLM operational log not readable - $($_.Exception.Message)" -Level Warning
@@ -3026,25 +3216,65 @@ function Invoke-HardenScan {
         $v1 = (& $get 4024) + (& $get 4025)
 
         if ($outbound -gt 0) {
-            $blockers.Add("NTLM outbound: $outbound authentication(s) left this machine. Deny outgoing NTLM at 2 refuses every one - the 8001 events name the target servers.")
+            & $addFinding 'LegacyAuth' "NTLM outbound: $outbound authentication(s) left a domain controller. Deny outgoing NTLM at 2 refuses every one - the 8001 events name the target servers. Member servers are not read here; their own logs hold the rest."
         }
         if ($inbound -gt 0) {
-            $blockers.Add("NTLM inbound: $inbound authentication(s) reached this machine. Deny incoming NTLM at 2 refuses every one - the 8002 events name the calling process.")
+            & $addFinding 'LegacyAuth' "NTLM inbound: $inbound authentication(s) reached a domain controller. Deny incoming NTLM at 2 refuses every one - the 8002 events name the calling process."
         }
         if ($domain -gt 0) {
-            $blockers.Add("NTLM in the domain: $domain authentication(s) observed by the domain audit. The 8004 events on the DC name user, workstation and target - this list is the migration worklist.")
+            & $addFinding 'LegacyAuth' "NTLM in the domain: $domain authentication(s) observed by the domain audit. The 8004 events on the DC name user, workstation and target - this list is the migration worklist."
         }
         if ($v1 -gt 0) {
-            $blockers.Add("NTLMv1-derived credentials: $v1 event(s). These stop working with the October 2026 enforcement regardless of anything this tool does - remediate first.")
+            & $addFinding 'LegacyAuth' "NTLMv1-derived credentials: $v1 event(s). These stop working with the October 2026 enforcement regardless of anything this tool does - remediate first."
         }
         if ($outbound -eq 0 -and $inbound -eq 0 -and $domain -eq 0 -and $v1 -eq 0) {
             if ($detail -gt 0) {
                 Write-HardenLog -Message "NTLM detail events only (4014): usage records with the reason NTLM was chosen - missing SPNs and IP-address access are the usual ones. Worth reading, but nothing here blocks enforcement by itself." -Level Info
             }
             else {
-                $blockers.Add("NTLM: $ntlmTotal event(s) recorded that carry no direction this tool recognises. Read the NTLM operational log before restricting anything.")
+                & $addFinding 'LegacyAuth' "NTLM: $ntlmTotal event(s) recorded that carry no direction this tool recognises. Read the NTLM operational log before restricting anything."
             }
         }
+    }
+
+    # -- certificate mapping -------------------------------------------------------------------
+    # The KDC has enforced strong certificate mapping since the February 2025 update and stopped
+    # reading StrongCertificateBindingEnforcement with the September 2025 update, so there is no
+    # setting left to stage. Events 39, 40 and 41 are still written - and now each one is a
+    # certificate logon that was refused, not a warning about a future one.
+    Write-HardenLog -Message 'Certificate mapping (KDC events 39, 40, 41)' -Level Header
+    $certTotal = 0
+    foreach ($dc in $(if ($NoEventLog) { @() } else { $dcs })) {
+        try {
+            $n = Invoke-Command -ComputerName $dc.HostName -ArgumentList $since -ErrorAction Stop -ScriptBlock {
+                param($start)
+                try {
+                    @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 39, 40, 41; StartTime = $start } -ErrorAction Stop |
+                            Where-Object { $_.ProviderName -match 'Kerberos-Key-Distribution|^Kdc' }).Count
+                }
+                catch {
+                    if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { throw }
+                    0
+                }
+            }
+            $certTotal += [int]$n
+            if ([int]$n -gt 0) {
+                Write-HardenLog -Message "$($dc.HostName): $n event(s) - certificates without a strong mapping" -Level Warning
+                Add-HardenAction -Area 'Scan' -Setting 'Certificate-Mapping' -Target $dc.HostName -Result 'Observed' `
+                    -Detail "$n KDC certificate mapping events in $Days days" -Severity 'High'
+            }
+            else {
+                Write-HardenLog -Message "$($dc.HostName): none" -Level Success
+            }
+        }
+        catch {
+            Write-HardenLog -Message "$($dc.HostName): System log not readable - $($_.Exception.Message)" -Level Warning
+        }
+    }
+    if ($certTotal -gt 0) {
+        # Informational, not gating: no group in this tool changes this behaviour any more. The
+        # certificates have to be reissued with the SID extension or mapped explicitly.
+        & $addFinding $null "Certificate mapping: $certTotal KDC event(s) 39/40/41. Since the 2025 enforcement these certificate logons fail - reissue the certificates with the SID extension or add an explicit strong mapping (KB5014754)."
     }
 
     # -- accounts that cannot do AES -----------------------------------------------------------
@@ -3052,16 +3282,18 @@ function Invoke-HardenScan {
     try {
         # msDS-SupportedEncryptionTypes: bit 0x4 is RC4, 0x8 and 0x10 are AES128 and AES256.
         # An account with the attribute unset falls back to whatever the DC allows.
-        # Bitwise AND (1.2.840.113556.1.4.803), not equality: an account at 0x7 or 0x4 both allow
-        # RC4 and only the first matches =4. What matters is RC4 on and no AES bit set at all.
-        $rc4Only = @(Get-ADObject -LDAPFilter '(&(|(objectClass=user)(objectClass=computer))(msDS-SupportedEncryptionTypes:1.2.840.113556.1.4.803:=4)(!(msDS-SupportedEncryptionTypes:1.2.840.113556.1.4.803:=24)))' `
+        # Bitwise matching rules, not equality: an account at 0x7 or 0x4 both allow RC4 and only
+        # the second matches =4. RC4 on is the AND rule (.803) on 0x4. "No AES bit at all" is the
+        # negated OR rule (.804) on 0x18 - up to 1.3.1 this used the AND rule there too, which
+        # only excludes accounts with BOTH AES bits and so listed 0x0C (RC4 + AES128) as RC4-only.
+        $rc4Only = @(Get-ADObject -LDAPFilter '(&(|(objectClass=user)(objectClass=computer))(msDS-SupportedEncryptionTypes:1.2.840.113556.1.4.803:=4)(!(msDS-SupportedEncryptionTypes:1.2.840.113556.1.4.804:=24)))' `
                 -Properties samAccountName, msDS-SupportedEncryptionTypes @ad -ErrorAction Stop)
         $unset = @(Get-ADUser -LDAPFilter '(&(servicePrincipalName=*)(!(msDS-SupportedEncryptionTypes=*)))' @ad -ErrorAction SilentlyContinue)
 
         if ($rc4Only.Count -gt 0) {
             Write-HardenLog -Message "$($rc4Only.Count) object(s) explicitly limited to RC4 - these stop authenticating if AES is enforced" -Level Warning
             foreach ($o in ($rc4Only | Select-Object -First 15)) { Write-HardenLog -Message "    $($o.Name)" -Level Info }
-            $blockers.Add("Kerberos AES: $($rc4Only.Count) object(s) are set to RC4 only.")
+            & $addFinding 'LegacyAuth' ("Kerberos AES: $($rc4Only.Count) object(s) are set to RC4 only.")
         }
         else {
             Write-HardenLog -Message 'No object is explicitly limited to RC4' -Level Success
@@ -3088,7 +3320,7 @@ function Invoke-HardenScan {
 
         if ($age -gt 365) {
             Write-HardenLog -Message 'Every Kerberos ticket in the domain is signed with this key. A golden ticket forged at any point since that date is still valid today, and nothing in the directory will tell you one exists.' -Level Warning
-            $blockers.Add("krbtgt password is $age days old. Reset it twice, with a full replication cycle plus the maximum ticket lifetime in between - resetting twice in quick succession invalidates every ticket at once and takes the domain down with it.")
+            & $addFinding $null ("krbtgt password is $age days old. Reset it twice, with a full replication cycle plus the maximum ticket lifetime in between - resetting twice in quick succession invalidates every ticket at once and takes the domain down with it.")
             Add-HardenAction -Area 'Scan' -Setting 'krbtgt-PasswordAge' -Target $ctx.DomainFqdn -Result 'Drift' -Detail "$age days" -Severity 'High'
         }
         elseif ($age -gt 180) {
@@ -3144,7 +3376,7 @@ function Invoke-HardenScan {
             }
         }
         if ($fwOff.Count -gt 0) {
-            $blockers.Add("The Windows Firewall is off on $($fwOff -join ', '). Every rule in the LOLBins group would deploy and do nothing there.")
+            & $addFinding 'LOLBins' ("The Windows Firewall is off on $($fwOff -join ', '). Every rule in the LOLBins group would deploy and do nothing there.")
         }
         Write-HardenLog -Message 'Member servers are not read here - the tool never connects to them. Sample one by hand if the estate is not uniform.' -Level Info
     }
@@ -3165,8 +3397,7 @@ function Invoke-HardenScan {
     # reads as something a default deployment would fix, and then does not. Same trap as -Area
     # being ignored - the scan answering about more than the deployment would touch.
     $baseline = @(Get-HardenBaseline | Where-Object {
-            $_.Type -eq 'SecurityOption' -and $_.Target -in 'DC', 'Both' -and $_.Group -in $scoped -and
-            ($HardeningProfile -eq 'Strict' -or $_.Profile -eq 'Baseline' -or $_.Profile -eq 'Strict')
+            $_.Type -eq 'SecurityOption' -and $_.Target -in 'DC', 'Both' -and $_.Group -in $scoped
         })
     $strictCount = @($baseline | Where-Object { $_.Profile -eq 'Strict' -and $HardeningProfile -ne 'Strict' }).Count
     if ($baseline.Count -eq 0) {
@@ -3175,53 +3406,73 @@ function Invoke-HardenScan {
     elseif ($strictCount -gt 0) {
         Write-HardenLog -Message "$strictCount of these belong to the Strict profile and are marked as such - deploying without -Profile Strict leaves them alone." -Level Info
     }
-    $dc = $dcs | Select-Object -First 1
+    # One WinRM round trip per DC for every value in scope, rather than one per value against the
+    # first DC only. Up to 1.3.1 this was some forty Invoke-Command calls to a single server, so a
+    # value set differently on another DC - the classic multi-site leftover - went unseen.
+    $wanted = @(foreach ($item in $baseline) {
+            $path = 'HKLM:\' + ($item.Key -replace '^MACHINE\\', '')
+            [pscustomobject]@{ Id = $item.Id; Path = (Split-Path $path -Parent); Name = (Split-Path $path -Leaf) }
+        })
+    $byDc = [ordered]@{}
+    foreach ($d in $dcs) {
+        try { $byDc[$d.HostName] = Read-HardenRegistryBatch -ComputerName $d.HostName -Values $wanted }
+        catch { Write-HardenLog -Message "$($d.HostName): registry not readable - $($_.Exception.Message)" -Level Warning }
+    }
 
-    if ($dc) {
+    # The directory server the run works against is the reference; the others are compared to it.
+    $refName = @($byDc.Keys | Where-Object { $_ -eq $ctx.Server }) + @($byDc.Keys) | Select-Object -First 1
+
+    if ($refName) {
+        if ($byDc.Count -gt 1) {
+            Write-HardenLog -Message "Values read from $($byDc.Count) domain controllers, shown for $refName; differences between them are called out." -Level Info
+        }
         foreach ($item in $baseline) {
-            $path = 'HKLM:\' + ($item.Key -replace '^MACHINE\\', '') 
-            $valueName = Split-Path $path -Leaf
-            $regPath = Split-Path $path -Parent
-            try {
-                $current = Invoke-Command -ComputerName $dc.HostName -ArgumentList $regPath, $valueName -ScriptBlock {
-                    param($p, $v)
-                    (Get-ItemProperty -Path $p -Name $v -ErrorAction SilentlyContinue).$v
-                } -ErrorAction Stop
+            $current = $byDc[$refName][$item.Id]
 
-                # Compare against what this run would actually write. Showing the enforcing value
-                # while running at Level Audit invites someone to deploy straight to Enforce
-                # because the scan appeared to ask for it.
-                $target = if ($item.Staged -and $Level -eq 'Audit') { $item.AuditValue } else { $item.EnforceValue }
+            # Compare against what this run would actually write. Showing the enforcing value
+            # while running at Level Audit invites someone to deploy straight to Enforce
+            # because the scan appeared to ask for it.
+            $target = if ($item.Staged -and $Level -eq 'Audit') { $item.AuditValue } else { $item.EnforceValue }
 
-                if ($null -eq $target) {
-                    # Staged with no observation form: nothing is deployed at this level, so there
-                    # is no target to compare against and reporting one would be misleading.
-                    $shown = if ($null -eq $current) { 'not set' } else { $current }
-                    Write-HardenLog -Message "$($item.Name): $shown - not deployed at Level Audit, would become $($item.EnforceValue) at Level Enforce" -Level Skip
-                    Add-HardenAction -Area 'Scan' -Setting $item.Id -Target $dc.HostName -Result 'Observed' `
-                        -Detail "Currently $shown; enforcing value $($item.EnforceValue)"
-                }
-                elseif ("$current" -eq "$target") {
-                    Write-HardenLog -Message "$($item.Name): already $current" -Level Success
-                    Add-HardenAction -Area 'Scan' -Setting $item.Id -Target $dc.HostName -Result 'Compliant' -Detail "Value $current"
-                }
-                elseif ($null -eq $current -and $item.Contains('DefaultWhenUnset') -and "$($item.DefaultWhenUnset)" -eq "$target") {
-                    # Absent, but Windows behaves as though it were set. Not a gap - deploying it
-                    # still pins the value against later drift, which is why it stays in the
-                    # baseline rather than being dropped.
-                    Write-HardenLog -Message "$($item.Name): not set, platform default is already $($item.DefaultWhenUnset)" -Level Success
-                    Add-HardenAction -Area 'Scan' -Setting $item.Id -Target $dc.HostName -Result 'Compliant' `
-                        -Detail "Not set; platform default $($item.DefaultWhenUnset) already matches. Deploying pins it."
-                }
-                else {
-                    $shown = if ($null -eq $current) { 'not set' } else { $current }
-                    $note = if ($item.Profile -eq 'Strict' -and $HardeningProfile -ne 'Strict') { ' [Strict profile - a default deployment will not touch this]' } else { '' }
-                    Write-HardenLog -Message "$($item.Name): $shown, target $target$note" -Level Info
-                    Add-HardenAction -Area 'Scan' -Setting $item.Id -Target $dc.HostName -Result 'Missing' -Detail "Currently $shown, target $target$note"
-                }
+            if ($null -eq $target) {
+                # Staged with no observation form: nothing is deployed at this level, so there
+                # is no target to compare against and reporting one would be misleading.
+                $shown = if ($null -eq $current) { 'not set' } else { $current }
+                Write-HardenLog -Message "$($item.Name): $shown - not deployed at Level Audit, would become $($item.EnforceValue) at Level Enforce" -Level Skip
+                Add-HardenAction -Area 'Scan' -Setting $item.Id -Target $refName -Result 'Observed' `
+                    -Detail "Currently $shown; enforcing value $($item.EnforceValue)"
             }
-            catch {
-                Write-HardenLog -Message "$($item.Name): not readable" -Level Skip
+            elseif ("$current" -eq "$target") {
+                Write-HardenLog -Message "$($item.Name): already $current" -Level Success
+                Add-HardenAction -Area 'Scan' -Setting $item.Id -Target $refName -Result 'Compliant' -Detail "Value $current"
+            }
+            elseif ($null -eq $current -and $item.Contains('DefaultWhenUnset') -and "$($item.DefaultWhenUnset)" -eq "$target") {
+                # Absent, but Windows behaves as though it were set. Not a gap - deploying it
+                # still pins the value against later drift, which is why it stays in the
+                # baseline rather than being dropped.
+                Write-HardenLog -Message "$($item.Name): not set, platform default is already $($item.DefaultWhenUnset)" -Level Success
+                Add-HardenAction -Area 'Scan' -Setting $item.Id -Target $refName -Result 'Compliant' `
+                    -Detail "Not set; platform default $($item.DefaultWhenUnset) already matches. Deploying pins it."
+            }
+            else {
+                $shown = if ($null -eq $current) { 'not set' } else { $current }
+                $note = if ($item.Profile -eq 'Strict' -and $HardeningProfile -ne 'Strict') { ' [Strict profile - a default deployment will not touch this]' } else { '' }
+                Write-HardenLog -Message "$($item.Name): $shown, target $target$note" -Level Info
+                Add-HardenAction -Area 'Scan' -Setting $item.Id -Target $refName -Result 'Missing' -Detail "Currently $shown, target $target$note"
+            }
+
+            # Same setting, different value on another DC. Group Policy will converge them once
+            # the GPO applies, but until then "the domain" has no single answer, and the scan
+            # should not pretend it does.
+            $others = @(foreach ($name in $byDc.Keys) {
+                    if ($name -eq $refName) { continue }
+                    $v = $byDc[$name][$item.Id]
+                    if ("$v" -ne "$current") { "$name=$(if ($null -eq $v) { 'not set' } else { $v })" }
+                })
+            if ($others.Count -gt 0) {
+                Write-HardenLog -Message "    differs on: $($others -join ', ')" -Level Warning
+                Add-HardenAction -Area 'Scan' -Setting $item.Id -Target 'Domain controllers' -Result 'Drift' `
+                    -Detail "$refName=$(if ($null -eq $current) { 'not set' } else { $current }); $($others -join ', ')" -Severity 'Medium'
             }
         }
     }
@@ -3261,6 +3512,7 @@ function Invoke-HardenDeployment {
         [Parameter(Mandatory)][string[]]$Area,
         [Parameter(Mandatory)][string]$GpoNamePattern,
         [string]$MemberOu,
+        [switch]$AllowDowngrade,
         [switch]$AuditOnly
     )
 
@@ -3349,6 +3601,12 @@ function Invoke-HardenDeployment {
             }
 
             # -- security options and services share one template per GPO ----------------------
+            # What the GPO carries today, so the never-weaken rule below can see an earlier
+            # Enforce run. Empty for a GPO that does not exist yet or has no template.
+            $existingTemplate = @{}
+            if ($creation.Gpo.Id -ne [guid]::Empty) {
+                $existingTemplate = Get-HardenTemplateValue -Gpo $creation.Gpo
+            }
             $registryValues = @{}
             $services = @{}
             $firewallItems = [System.Collections.Generic.List[object]]::new()
@@ -3358,6 +3616,23 @@ function Invoke-HardenDeployment {
 
                     'SecurityOption' {
                         $value = if ($item.Staged -and $Level -eq 'Audit') { $item.AuditValue } else { $item.EnforceValue }
+
+                        # Never weaken. Level Audit means "observe before requiring", not "lower
+                        # what is already required": a GPO that an earlier run took to Enforce, or
+                        # a domain controller that already enforces (new Server 2025 domains
+                        # require LDAP signing out of the box), keeps the enforcing value unless
+                        # -AllowDowngrade says the step back is deliberate.
+                        if ($item.Staged -and $Level -eq 'Audit' -and $null -ne $value -and -not $AllowDowngrade) {
+                            $inGpo = $existingTemplate[$item.Key.ToUpperInvariant()]
+                            $onDc = if ($role -eq 'DC') { Get-HardenLiveValue -Item $item } else { $null }
+                            $where = if ("$inGpo" -eq "$($item.EnforceValue)") { "already enforcing in $gpoName" }
+                            elseif ("$onDc" -eq "$($item.EnforceValue)") { "already enforced on $($ctx.Server)" }
+                            else { $null }
+                            if ($where) {
+                                Write-HardenLog -Message "$($item.Name): $where - kept at $($item.EnforceValue) rather than lowered to the observing $value. -AllowDowngrade lowers it deliberately." -Level Warning
+                                $value = $item.EnforceValue
+                            }
+                        }
 
                         # Guarded rather than skipped with continue: inside a switch, continue moves
                         # to the next switch item, not the next item of the enclosing foreach. It
@@ -3510,8 +3785,26 @@ function Invoke-HardenDeployment {
                 continue
             }
 
+            # Precedence before linking: a GPO that outranks this one on the same OU and sets the
+            # same security options would silently win on every client. Found, it is reported and
+            # this link goes to position 1 - otherwise an Enforce run deploys values that the
+            # Default Domain Controllers Policy quietly overrides.
+            $conflicts = @()
             try {
-                $result = Set-HardenGpoLink -GpoName $gpoName -TargetDn $targetDn -AuditOnly:$AuditOnly -Confirm:$false
+                $conflicts = @(Get-HardenLinkConflict -GpoName $gpoName -TargetDn $targetDn -Keys @($registryValues.Keys))
+            }
+            catch {
+                Write-HardenLog -Message "Could not compare link precedence on $targetDn - $($_.Exception.Message)" -Level Warning
+            }
+            foreach ($c in $conflicts) {
+                $names = ($c.Keys | ForEach-Object { Split-Path $_ -Leaf }) -join ', '
+                Write-HardenLog -Message "$($c.Gpo) (link order $($c.Order)) outranks $gpoName and sets the same value(s): $names" -Level Warning
+                Add-HardenAction -Area $group -Setting "$gpoName precedence" -Target $targetDn -Result $(if ($AuditOnly) { 'Drift' } else { 'Observed' }) `
+                    -Detail "$($c.Gpo) at link order $($c.Order) also sets $names" -Severity 'High'
+            }
+
+            try {
+                $result = Set-HardenGpoLink -GpoName $gpoName -TargetDn $targetDn -TakePrecedence:($conflicts.Count -gt 0) -AuditOnly:$AuditOnly -Confirm:$false
                 Write-HardenLog -Message "Link $gpoName -> $targetDn : $result" -Level $(if ($result -eq 'Compliant') { 'Skip' } else { 'Success' })
                 Add-HardenAction -Area $group -Setting "$gpoName link" -Target $targetDn -Result $result
             }
@@ -3857,7 +4150,7 @@ footer{color:#7a848f;font-size:12px;text-align:center;padding-top:6px}
   header.top{background:#fff;color:#000;border-bottom:2px solid #000}
   header.top .sub{color:#444}
   .controls{display:none}.topic{break-inside:avoid}
-  details{open:true}.tbody{display:block !important}
+  .tbody{display:block !important}
 }
 '@
 
@@ -3910,6 +4203,18 @@ footer{color:#7a848f;font-size:12px;text-align:center;padding-top:6px}
       Array.prototype.slice.call(document.querySelectorAll(".topic")).forEach(function (d) { d.open = open; });
     });
   }
+
+  // details elements do not open for print through CSS, so open them for the printout and
+  // put them back afterwards.
+  var reopened = [];
+  window.addEventListener("beforeprint", function () {
+    reopened = Array.prototype.slice.call(document.querySelectorAll("details.topic:not([open])"));
+    reopened.forEach(function (d) { d.open = true; });
+  });
+  window.addEventListener("afterprint", function () {
+    reopened.forEach(function (d) { d.open = false; });
+    reopened = [];
+  });
 
   apply();
 })();
@@ -4238,11 +4543,11 @@ function Show-HardenMenu {
     }
 
     # -- profile -------------------------------------------------------------------------------
-    $profile = Read-HardenMenuChoice -Question 'Which profile?' -Default '1' -Options @(
+    $profileChoice = Read-HardenMenuChoice -Question 'Which profile?' -Default '1' -Options @(
         @{ Key = '1'; Label = 'Baseline - little or no compatibility risk' }
         @{ Key = '2'; Label = 'Strict - adds TLS 1.0/1.1 removal, RC4 ciphers, spooler RPC and more'; Detail = 'Needs a maintenance window and a rollback plan.' }
     )
-    $choice.HardeningProfile = @('Baseline', 'Strict')[[int]$profile - 1]
+    $choice.HardeningProfile = @('Baseline', 'Strict')[[int]$profileChoice - 1]
 
     if ($choice.Mode -eq 'Audit') { return $choice }
 
@@ -4395,6 +4700,7 @@ $runParameters = [ordered]@{
     Apply          = [bool]$Apply
     Interactive    = [bool]$Interactive
     Force          = [bool]$Force
+    AllowDowngrade = [bool]$AllowDowngrade
     GpoNamePattern = $GpoNamePattern
     MemberServerOu = $MemberServerOu
     ScanDays       = $ScanDays
@@ -4473,8 +4779,37 @@ switch ($Mode) {
             Write-Host '  PLAN MODE - nothing will be changed. Re-run with -Apply to deploy.' -ForegroundColor Yellow
         }
 
-        if ($Level -eq 'Enforce' -and -not $Force) {
-            Write-HardenLog -Message 'Level Enforce was requested. Run -Mode Scan first and read the result - this is the run that can break things.' -Level Warning
+        # The gate the README and -Force have always described, and which up to 1.3.1 was only a
+        # warning: an Enforce run scans first, and findings that concern the groups being enforced
+        # stop it. Informational findings (krbtgt age, certificate mapping) never do, and neither
+        # do findings about groups outside -Area. In plan mode the findings are shown and the plan
+        # still runs, because a plan writes nothing.
+        $enforceBlockers = @()
+        if ($Level -eq 'Enforce') {
+            Write-HardenLog -Message 'Level Enforce: scanning first, so the run can stop before it breaks something that is still in use.' -Level Info
+            [void](Invoke-HardenScan -Days $ScanDays -Level 'Enforce' -Area $Area -HardeningProfile $HardeningProfile -NoEventLog:$NoEventLog)
+            $enforceBlockers = @($script:ScanFindings | Where-Object { $_.Group -and $_.Group -in $Area })
+            # The scan's own actions describe the domain, not this deployment; keeping them would
+            # mix two runs into one report.
+            $script:Actions.Clear()
+
+            if ($enforceBlockers.Count -gt 0 -and $Apply -and -not $Force) {
+                Write-HardenLog -Message "Not deploying: $($enforceBlockers.Count) finding(s) concern the groups this run would enforce." -Level Error
+                foreach ($b in $enforceBlockers) { Write-HardenLog -Message "    [$($b.Group)] $($b.Text)" -Level Warning }
+                Write-HardenLog -Message 'Resolve them, or re-run with -Force to enforce anyway. Nothing was written.' -Level Warning
+                $summary = New-HardenSummary -Mode 'Scan' -Started $started -Context (Get-HardenContext) -RunParameters $runParameters `
+                    -Baseline (Get-HardenBaseline | Where-Object { $_.Group -in $Area }) -Blockers @($enforceBlockers | ForEach-Object { $_.Text })
+                $report = New-HardenReport -Summary $summary -OutputDirectory $ReportDirectory
+                Write-HardenLog -Message "Report: $($report.Html)" -Level Info
+                exit 4
+            }
+            elseif ($enforceBlockers.Count -gt 0) {
+                $why = if ($Force) { '-Force given, enforcing anyway' } else { 'plan mode, nothing is written' }
+                Write-HardenLog -Message "$($enforceBlockers.Count) finding(s) concern the groups being enforced ($why)." -Level Warning
+            }
+            else {
+                Write-HardenLog -Message 'The scan found nothing that the groups in scope would break.' -Level Success
+            }
         }
 
         # The brake for the unattended sharp run. Not shown with -Interactive, where every topic is
@@ -4503,7 +4838,7 @@ switch ($Mode) {
 
         try {
             Invoke-HardenDeployment -HardeningProfile $HardeningProfile -Level $Level -Area $Area `
-                -GpoNamePattern $GpoNamePattern -MemberOu $MemberServerOu -Confirm:$false
+                -GpoNamePattern $GpoNamePattern -MemberOu $MemberServerOu -AllowDowngrade:$AllowDowngrade -Confirm:$false
         }
         catch {
             if ($_.Exception.Message -ne 'HardenAbort') { throw }
