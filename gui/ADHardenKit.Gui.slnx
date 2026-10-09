@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="ADHardenKit.Gui/ADHardenKit.Gui.csproj" />
+  <Project Path="ADHardenKit.Gui.Tests/ADHardenKit.Gui.Tests.csproj" />
+</Solution>

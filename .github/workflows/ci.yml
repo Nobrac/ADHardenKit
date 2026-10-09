@@ -48,3 +48,33 @@ jobs:
           $cfg.Run.Path = './tests'
           $cfg.Run.Exit = $true
           Invoke-Pester -Configuration $cfg
+
+  gui:
+    name: GUI build and tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Test
+        run: dotnet test gui/ADHardenKit.Gui.Tests -c Release
+
+      - name: Publish (self-contained, single file)
+        run: >
+          dotnet publish gui/ADHardenKit.Gui/ADHardenKit.Gui.csproj -c Release -r win-x64 --self-contained
+          -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true
+          -o publish
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Remove-Item publish/*.pdb -ErrorAction SilentlyContinue
+          Copy-Item ADHardenKit.ps1, Verify-LoggingDeployment.ps1, Verify-MemberDeployment.ps1, README.md, LICENSE -Destination publish
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ADHardenKit-win-x64
+          path: publish/

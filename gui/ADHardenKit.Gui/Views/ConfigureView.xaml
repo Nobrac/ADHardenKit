@@ -1,0 +1,198 @@
+<UserControl x:Class="ADHardenKit.Gui.Views.ConfigureView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="clr-namespace:ADHardenKit.Gui.ViewModels">
+    <UserControl.Resources>
+        <CollectionViewSource x:Key="GroupedTopics" Source="{Binding Topics}">
+            <CollectionViewSource.GroupDescriptions>
+                <PropertyGroupDescription PropertyName="Group" />
+            </CollectionViewSource.GroupDescriptions>
+        </CollectionViewSource>
+    </UserControl.Resources>
+
+    <StackPanel>
+        <TextBlock Style="{StaticResource PageTitle}" Text="Choose what to deploy" />
+        <TextBlock Style="{StaticResource PageSubtitle}"
+                   Text="Preselected for the rollout step you picked. Change anything - the next page shows the exact plan before a single value is written." />
+
+        <!-- Profile and level -->
+        <UniformGrid Columns="2">
+            <Border Style="{StaticResource Card}" Margin="0,0,6,12">
+                <StackPanel>
+                    <TextBlock Text="Profile" FontWeight="SemiBold" Margin="0,0,0,8" />
+                    <RadioButton GroupName="Profile" IsChecked="{Binding IsBaseline}" Margin="0,0,0,6">
+                        <StackPanel>
+                            <TextBlock Text="Baseline" FontWeight="SemiBold" />
+                            <TextBlock Style="{StaticResource Muted}" Text="Little or no compatibility risk. The right start for every domain." />
+                        </StackPanel>
+                    </RadioButton>
+                    <RadioButton GroupName="Profile" IsChecked="{Binding IsStrict}">
+                        <StackPanel>
+                            <TextBlock Text="Strict" FontWeight="SemiBold" />
+                            <TextBlock Style="{StaticResource Muted}" Text="Adds TLS 1.0/1.1 removal, RC4 ciphers, spooler RPC and more. Needs a maintenance window." />
+                        </StackPanel>
+                    </RadioButton>
+                </StackPanel>
+            </Border>
+            <Border Style="{StaticResource Card}" Margin="6,0,0,12">
+                <StackPanel>
+                    <TextBlock Text="Level" FontWeight="SemiBold" Margin="0,0,0,8" />
+                    <RadioButton GroupName="Level" IsChecked="{Binding IsAudit}" Margin="0,0,0,6">
+                        <StackPanel>
+                            <TextBlock Text="Observe (Audit)" FontWeight="SemiBold" />
+                            <TextBlock Style="{StaticResource Muted}" Text="Staged settings log instead of block: LDAP signing negotiates, NTLM is audited." />
+                        </StackPanel>
+                    </RadioButton>
+                    <RadioButton GroupName="Level" IsChecked="{Binding IsEnforce}">
+                        <StackPanel>
+                            <TextBlock Text="Enforce" FontWeight="SemiBold" />
+                            <TextBlock Style="{StaticResource Muted}" Text="Staged settings require. The engine scans first and refuses if something still depends on them." />
+                        </StackPanel>
+                    </RadioButton>
+                </StackPanel>
+            </Border>
+        </UniformGrid>
+
+        <!-- What the last scan says about enforcing these groups -->
+        <Border Style="{StaticResource Card}" BorderBrush="{StaticResource WarningBrush}"
+                Visibility="{Binding EnforceWarnings.Count, Converter={x:Static vm:Converters.PositiveToVisibility}}">
+            <StackPanel>
+                <TextBlock FontWeight="SemiBold" Text="The last scan found things that enforcing these groups would break:" TextWrapping="Wrap" Margin="0,0,0,8" />
+                <ItemsControl ItemsSource="{Binding EnforceWarnings}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <TextBlock Text="{Binding}" TextWrapping="Wrap" Margin="0,0,0,4" />
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </StackPanel>
+        </Border>
+
+        <!-- Groups -->
+        <TextBlock Style="{StaticResource SectionTitle}" Text="Groups" />
+        <ItemsControl ItemsSource="{Binding Areas}">
+            <ItemsControl.ItemsPanel>
+                <ItemsPanelTemplate><UniformGrid Columns="2" /></ItemsPanelTemplate>
+            </ItemsControl.ItemsPanel>
+            <ItemsControl.ItemTemplate>
+                <DataTemplate DataType="{x:Type vm:AreaOption}">
+                    <CheckBox IsChecked="{Binding IsSelected}" Margin="0,0,12,10" VerticalContentAlignment="Top">
+                        <StackPanel>
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
+                                <TextBlock Text="{Binding SettingCount, StringFormat=' ({0})'}" Opacity="0.6" />
+                                <Border Style="{StaticResource Badge}" Visibility="{Binding IsOptIn, Converter={StaticResource BoolToVisibility}}">
+                                    <TextBlock Text="opt-in" FontSize="11" />
+                                </Border>
+                            </StackPanel>
+                            <TextBlock Style="{StaticResource Muted}" Text="{Binding Description}" FontSize="12" />
+                        </StackPanel>
+                    </CheckBox>
+                </DataTemplate>
+            </ItemsControl.ItemTemplate>
+        </ItemsControl>
+
+        <!-- Member server OU -->
+        <TextBlock Style="{StaticResource SectionTitle}" Text="Member server OU" />
+        <ComboBox IsEditable="True" ItemsSource="{Binding OrganizationalUnits}"
+                  Text="{Binding MemberServerOu, UpdateSourceTrigger=PropertyChanged}" IsTextSearchEnabled="True" />
+        <TextBlock Style="{StaticResource Muted}" Text="{Binding OuHint}" FontSize="12" Margin="0,6,0,0" />
+
+        <!-- Topics -->
+        <DockPanel Margin="0,16,0,8">
+            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                <Button Content="All" Command="{Binding IncludeAllTopicsCommand}" Margin="0,0,6,0" />
+                <Button Content="None" Command="{Binding ExcludeAllTopicsCommand}" />
+            </StackPanel>
+            <TextBlock Style="{StaticResource SectionTitle}" Margin="0" Text="Topics" VerticalAlignment="Center" />
+        </DockPanel>
+        <Grid>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="320" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <Border Style="{StaticResource Card}" Padding="4" Margin="0,0,12,12">
+                <ListBox ItemsSource="{Binding Source={StaticResource GroupedTopics}}" SelectedItem="{Binding SelectedTopic}"
+                         Height="440" BorderThickness="0" Background="Transparent" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                    <ListBox.GroupStyle>
+                        <GroupStyle>
+                            <GroupStyle.HeaderTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding Name}" FontWeight="SemiBold" Opacity="0.7" Margin="8,10,0,4" />
+                                </DataTemplate>
+                            </GroupStyle.HeaderTemplate>
+                        </GroupStyle>
+                    </ListBox.GroupStyle>
+                    <ListBox.ItemTemplate>
+                        <DataTemplate DataType="{x:Type vm:TopicOption}">
+                            <DockPanel>
+                                <CheckBox DockPanel.Dock="Left" IsChecked="{Binding IsIncluded}" VerticalAlignment="Center" MinWidth="0" Margin="0,0,4,0" />
+                                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                    <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" MaxWidth="190" />
+                                    <TextBlock Style="{StaticResource Icon}" FontSize="12" Text="&#xE8A1;" Margin="6,0,0,0" ToolTip="Staged: observes at level Audit"
+                                               Visibility="{Binding HasStaged, Converter={StaticResource BoolToVisibility}}" />
+                                    <TextBlock Style="{StaticResource Icon}" FontSize="12" Text="&#xE777;" Margin="6,0,0,0" ToolTip="Needs a reboot"
+                                               Visibility="{Binding NeedsReboot, Converter={StaticResource BoolToVisibility}}" />
+                                </StackPanel>
+                            </DockPanel>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </Border>
+
+            <!-- Details of the selected topic -->
+            <Border Grid.Column="1" Style="{StaticResource Card}" DataContext="{Binding SelectedTopic}">
+                <ScrollViewer MaxHeight="440" VerticalScrollBarVisibility="Auto">
+                    <StackPanel>
+                        <TextBlock Text="{Binding Name}" FontSize="18" FontWeight="SemiBold" TextWrapping="Wrap" />
+                        <WrapPanel Margin="0,6,0,10">
+                            <Border Style="{StaticResource Badge}" Margin="0,0,6,4"><TextBlock Text="{Binding Group}" FontSize="11" /></Border>
+                            <Border Style="{StaticResource Badge}" Margin="0,0,6,4" Visibility="{Binding HasStaged, Converter={StaticResource BoolToVisibility}}"><TextBlock Text="staged" FontSize="11" /></Border>
+                            <Border Style="{StaticResource Badge}" Margin="0,0,6,4" Visibility="{Binding NeedsReboot, Converter={StaticResource BoolToVisibility}}"><TextBlock Text="reboot" FontSize="11" /></Border>
+                            <Border Style="{StaticResource Badge}" Margin="0,0,6,4" Visibility="{Binding IsStrict, Converter={StaticResource BoolToVisibility}}"><TextBlock Text="Strict" FontSize="11" /></Border>
+                            <Border Style="{StaticResource Badge}" Margin="0,0,6,4" Visibility="{Binding MinOs, Converter={x:Static vm:Converters.NotNullToVisibility}}"><TextBlock Text="{Binding MinOs, StringFormat='{}{0}+'}" FontSize="11" /></Border>
+                            <Border Style="{StaticResource Badge}" Margin="0,0,6,4" Visibility="{Binding Reference, Converter={x:Static vm:Converters.NotNullToVisibility}}"><TextBlock Text="{Binding Reference}" FontSize="11" /></Border>
+                        </WrapPanel>
+                        <ItemsControl ItemsSource="{Binding Settings}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate DataType="{x:Type vm:SettingRow}">
+                                    <StackPanel Margin="0,0,0,14">
+                                        <TextBlock Text="{Binding Info.Name}" FontWeight="SemiBold" TextWrapping="Wrap" />
+                                        <TextBlock Style="{StaticResource Muted}" FontSize="12">
+                                            <Run Text="{Binding TargetText, Mode=OneWay}" />
+                                            <Run Text="{Binding Info.MinOs, Mode=OneWay, StringFormat=' - needs {0}'}" />
+                                        </TextBlock>
+                                        <TextBlock Text="{Binding Info.Why}" TextWrapping="Wrap" Margin="0,4,0,0" />
+                                        <TextBlock Margin="0,4,0,0" FontSize="12" TextWrapping="Wrap"
+                                                   Visibility="{Binding Info.Staged, Converter={StaticResource BoolToVisibility}}">
+                                            <Run Text="Observing:" FontWeight="SemiBold" /> <Run Text="{Binding Info.AuditText, Mode=OneWay}" />
+                                            <Run Text="  Enforcing:" FontWeight="SemiBold" /> <Run Text="{Binding Info.EnforceText, Mode=OneWay}" />
+                                        </TextBlock>
+                                        <TextBlock Text="{Binding Info.Observe, StringFormat='Where it shows: {0}'}" Style="{StaticResource Muted}" FontSize="12" Margin="0,4,0,0"
+                                                   Visibility="{Binding Info.Observe, Converter={x:Static vm:Converters.NotNullToVisibility}}" />
+                                        <TextBlock FontSize="12" Margin="0,4,0,0" TextWrapping="Wrap"
+                                                   Visibility="{Binding HasCurrent, Converter={StaticResource BoolToVisibility}}">
+                                            <Run Text="Today:" FontWeight="SemiBold" /> <Run Text="{Binding CurrentResult, Mode=OneWay}" /> <Run Text="-" /> <Run Text="{Binding Current, Mode=OneWay}" />
+                                        </TextBlock>
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
+        </Grid>
+
+        <!-- Summary and the same run as a command line -->
+        <Border Style="{StaticResource Card}">
+            <StackPanel>
+                <TextBlock Text="{Binding ScopeSummary}" FontWeight="SemiBold" TextWrapping="Wrap" />
+                <TextBlock Style="{StaticResource Muted}" FontSize="12" Margin="0,8,0,4" Text="The same deployment as a command line, for a script or a change ticket:" />
+                <DockPanel>
+                    <Button DockPanel.Dock="Right" Content="Copy" Margin="8,0,0,0" Command="{Binding CopyCommandLineCommand}" VerticalAlignment="Top" />
+                    <TextBox Text="{Binding CommandLine, Mode=OneWay}" IsReadOnly="True" TextWrapping="Wrap" FontFamily="Cascadia Mono, Consolas" />
+                </DockPanel>
+            </StackPanel>
+        </Border>
+    </StackPanel>
+</UserControl>

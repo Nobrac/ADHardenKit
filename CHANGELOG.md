@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.5.0
+
+### Added
+
+- **A guided Windows app** (`gui/`, WPF on .NET 10, shipped as one self-contained `ADHardenKit.exe`).
+  It follows the recommended rollout, remembers per domain which steps are done, and runs the
+  engine for every step: check, scan, choose, preview, deploy, report. Enforce asks for the domain
+  name to be typed, and a run the engine's scan refuses shows the findings instead of writing.
+- `-Mode Catalog`: the baseline as JSON, without a domain or RSAT.
+- `-EventStream`: machine-readable output for a front end.
+- `-ExcludeTopic`: leave named topics out of a Deploy run without `-Interactive`.
+- CI builds and tests the app; a `v*` tag publishes a release zip with the app and the scripts.
+
 ## 1.4.0
 
 ### Fixed

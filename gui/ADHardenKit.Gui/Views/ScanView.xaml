@@ -1,0 +1,84 @@
+<UserControl x:Class="ADHardenKit.Gui.Views.ScanView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="clr-namespace:ADHardenKit.Gui.ViewModels">
+    <StackPanel>
+        <TextBlock Style="{StaticResource PageTitle}" Text="Scan" />
+        <TextBlock Style="{StaticResource PageSubtitle}"
+                   Text="Reads the event logs and the current settings on every domain controller, and the directory. Changes nothing." />
+
+        <ContentControl Content="{Binding}" ContentTemplate="{StaticResource RunStatusTemplate}" />
+
+        <!-- Verdict -->
+        <Border Style="{StaticResource Card}" Visibility="{Binding Verdict, Converter={x:Static vm:Converters.NotNullToVisibility}}">
+            <StackPanel>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock FontSize="22">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock" BasedOn="{StaticResource Icon}">
+                                <Setter Property="Text" Value="&#xE7BA;" />
+                                <Setter Property="Foreground" Value="{StaticResource WarningBrush}" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsClean}" Value="True">
+                                        <Setter Property="Text" Value="&#xE73E;" />
+                                        <Setter Property="Foreground" Value="{StaticResource SuccessBrush}" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                    <TextBlock Text="{Binding Verdict}" FontSize="16" FontWeight="SemiBold" Margin="10,0,0,0" TextWrapping="Wrap" VerticalAlignment="Center" />
+                </StackPanel>
+                <UniformGrid Columns="3" Margin="0,14,0,0">
+                    <StackPanel>
+                        <TextBlock Text="{Binding CompliantCount}" FontSize="24" FontWeight="SemiBold" Foreground="{StaticResource SuccessBrush}" />
+                        <TextBlock Style="{StaticResource Muted}" Text="settings already in place" />
+                    </StackPanel>
+                    <StackPanel>
+                        <TextBlock Text="{Binding GapCount}" FontSize="24" FontWeight="SemiBold" />
+                        <TextBlock Style="{StaticResource Muted}" Text="settings still to deploy" />
+                    </StackPanel>
+                    <StackPanel>
+                        <TextBlock Text="{Binding DriftCount}" FontSize="24" FontWeight="SemiBold" Foreground="{StaticResource WarningBrush}" />
+                        <TextBlock Style="{StaticResource Muted}" Text="differ between domain controllers" />
+                    </StackPanel>
+                </UniformGrid>
+                <Button Content="Open the full report" HorizontalAlignment="Left" Margin="0,14,0,0" Command="{Binding OpenReportCommand}"
+                        Visibility="{Binding ReportHtml, Converter={x:Static vm:Converters.NotNullToVisibility}}" />
+            </StackPanel>
+        </Border>
+
+        <!-- Findings, grouped by the group they would block -->
+        <ItemsControl ItemsSource="{Binding Groups}">
+            <ItemsControl.ItemTemplate>
+                <DataTemplate DataType="{x:Type vm:FindingGroup}">
+                    <Border Style="{StaticResource Card}">
+                        <StackPanel>
+                            <TextBlock Text="{Binding Title}" FontWeight="SemiBold" FontSize="15" Margin="0,0,0,8" />
+                            <ItemsControl ItemsSource="{Binding Items}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <DockPanel Margin="0,0,0,6">
+                                            <TextBlock DockPanel.Dock="Left" Style="{StaticResource Icon}" Text="&#xE7BA;" FontSize="13" Foreground="{StaticResource WarningBrush}" VerticalAlignment="Top" Margin="0,2,8,0" />
+                                            <TextBlock Text="{Binding}" TextWrapping="Wrap" />
+                                        </DockPanel>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Border>
+                </DataTemplate>
+            </ItemsControl.ItemTemplate>
+        </ItemsControl>
+
+        <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+            <TextBlock Text="Days of event log to read:" VerticalAlignment="Center" />
+            <Slider Minimum="1" Maximum="180" Width="200" Margin="10,0" VerticalAlignment="Center"
+                    Value="{Binding ScanDays}" IsSnapToTickEnabled="True" TickFrequency="1" />
+            <TextBlock Text="{Binding ScanDays}" VerticalAlignment="Center" Width="40" />
+            <Button Content="Scan again" Command="{Binding RunScanCommand}" Margin="12,0,0,0" />
+        </StackPanel>
+
+        <ContentControl Content="{Binding}" ContentTemplate="{StaticResource RunLogTemplate}" />
+    </StackPanel>
+</UserControl>
