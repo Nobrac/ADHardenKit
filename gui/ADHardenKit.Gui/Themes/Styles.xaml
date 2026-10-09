@@ -1,0 +1,130 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:vm="clr-namespace:ADHardenKit.Gui.ViewModels">
+
+    <FontFamily x:Key="IconFont">Segoe Fluent Icons, Segoe MDL2 Assets</FontFamily>
+
+    <SolidColorBrush x:Key="SuccessBrush" Color="#2E9E44" />
+    <SolidColorBrush x:Key="WarningBrush" Color="#C98A00" />
+    <SolidColorBrush x:Key="ErrorBrush" Color="#D13438" />
+    <SolidColorBrush x:Key="AccentSoftBrush" Color="#200078D4" />
+
+    <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+
+    <Style x:Key="PageTitle" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="28" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Margin" Value="0,0,0,4" />
+    </Style>
+
+    <Style x:Key="PageSubtitle" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="14" />
+        <Setter Property="Opacity" Value="0.75" />
+        <Setter Property="TextWrapping" Value="Wrap" />
+        <Setter Property="Margin" Value="0,0,0,20" />
+    </Style>
+
+    <Style x:Key="SectionTitle" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="16" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Margin" Value="0,16,0,8" />
+    </Style>
+
+    <Style x:Key="Muted" TargetType="TextBlock">
+        <Setter Property="Opacity" Value="0.7" />
+        <Setter Property="TextWrapping" Value="Wrap" />
+    </Style>
+
+    <Style x:Key="Card" TargetType="Border">
+        <Setter Property="Background" Value="{DynamicResource CardBackgroundFillColorDefaultBrush}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource CardStrokeColorDefaultBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="CornerRadius" Value="8" />
+        <Setter Property="Padding" Value="16" />
+        <Setter Property="Margin" Value="0,0,0,12" />
+    </Style>
+
+    <Style x:Key="Icon" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="{StaticResource IconFont}" />
+        <Setter Property="FontSize" Value="16" />
+        <Setter Property="VerticalAlignment" Value="Center" />
+    </Style>
+
+    <Style x:Key="Badge" TargetType="Border">
+        <Setter Property="CornerRadius" Value="4" />
+        <Setter Property="Padding" Value="6,1" />
+        <Setter Property="Margin" Value="6,0,0,0" />
+        <Setter Property="VerticalAlignment" Value="Center" />
+        <Setter Property="Background" Value="{StaticResource AccentSoftBrush}" />
+    </Style>
+
+    <!-- One line of engine output: icon coloured by level, header lines set apart. -->
+    <DataTemplate x:Key="LogLineTemplate" DataType="{x:Type vm:LogLine}">
+        <Grid Margin="0,1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="24" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <TextBlock x:Name="Glyph" Style="{StaticResource Icon}" FontSize="13" Text="{Binding Glyph}" Opacity="0.7" VerticalAlignment="Top" Margin="0,2,0,0" />
+            <TextBlock x:Name="Text" Grid.Column="1" Text="{Binding Message}" TextWrapping="Wrap" FontFamily="Cascadia Mono, Consolas" FontSize="12" />
+        </Grid>
+        <DataTemplate.Triggers>
+            <DataTrigger Binding="{Binding Level}" Value="Success">
+                <Setter TargetName="Glyph" Property="Foreground" Value="{StaticResource SuccessBrush}" />
+                <Setter TargetName="Glyph" Property="Opacity" Value="1" />
+            </DataTrigger>
+            <DataTrigger Binding="{Binding Level}" Value="Warning">
+                <Setter TargetName="Glyph" Property="Foreground" Value="{StaticResource WarningBrush}" />
+                <Setter TargetName="Glyph" Property="Opacity" Value="1" />
+            </DataTrigger>
+            <DataTrigger Binding="{Binding Level}" Value="Error">
+                <Setter TargetName="Glyph" Property="Foreground" Value="{StaticResource ErrorBrush}" />
+                <Setter TargetName="Glyph" Property="Opacity" Value="1" />
+                <Setter TargetName="Text" Property="Foreground" Value="{StaticResource ErrorBrush}" />
+            </DataTrigger>
+            <DataTrigger Binding="{Binding Level}" Value="Skip">
+                <Setter TargetName="Text" Property="Opacity" Value="0.6" />
+            </DataTrigger>
+            <DataTrigger Binding="{Binding IsHeader}" Value="True">
+                <Setter TargetName="Text" Property="FontWeight" Value="SemiBold" />
+                <Setter TargetName="Text" Property="FontFamily" Value="Segoe UI Variable Text, Segoe UI" />
+                <Setter TargetName="Text" Property="FontSize" Value="13" />
+                <Setter TargetName="Text" Property="Margin" Value="0,8,0,2" />
+                <Setter TargetName="Glyph" Property="Margin" Value="0,10,0,0" />
+            </DataTrigger>
+        </DataTemplate.Triggers>
+    </DataTemplate>
+
+    <!-- Collapsible console with the full engine output, shared by every run page. -->
+    <DataTemplate x:Key="RunLogTemplate" DataType="{x:Type vm:RunStepViewModel}">
+        <Expander Header="Engine output" Margin="0,8,0,0">
+            <Border Style="{StaticResource Card}" Padding="8" Margin="0,8,0,0">
+                <ListBox ItemsSource="{Binding Log}" ItemTemplate="{StaticResource LogLineTemplate}"
+                         MaxHeight="320" BorderThickness="0" Background="Transparent"
+                         ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                         VirtualizingPanel.IsVirtualizing="True" />
+            </Border>
+        </Expander>
+    </DataTemplate>
+
+    <!-- Running indicator with the engine's current section and a stop button. -->
+    <DataTemplate x:Key="RunStatusTemplate" DataType="{x:Type vm:RunStepViewModel}">
+        <Border Style="{StaticResource Card}">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel>
+                    <TextBlock Text="{Binding StatusText}" FontWeight="SemiBold" TextWrapping="Wrap" />
+                    <ProgressBar IsIndeterminate="True" Height="4" Margin="0,10,0,0"
+                                 Visibility="{Binding IsBusy, Converter={StaticResource BoolToVisibility}}" />
+                </StackPanel>
+                <Button Grid.Column="1" Content="Stop" Margin="12,0,0,0" VerticalAlignment="Center"
+                        Command="{Binding CancelCommand}"
+                        Visibility="{Binding IsBusy, Converter={StaticResource BoolToVisibility}}" />
+            </Grid>
+        </Border>
+    </DataTemplate>
+
+</ResourceDictionary>

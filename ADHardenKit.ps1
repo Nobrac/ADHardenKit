@@ -154,6 +154,17 @@
     earlier Enforce run, or on the directory server itself. This switch allows exactly that, for a
     deliberate step back from Enforce to the observing form.
 
+    .PARAMETER ExcludeTopic
+    Topics to leave out of a Deploy run, by name as the baseline gives them (for example
+    'Credential Guard and VBS'). The non-interactive equivalent of declining a topic card - used by
+    the graphical front end, and handy in a script that deploys everything but one topic.
+
+    .PARAMETER EventStream
+    Machine-readable output for a front end: every log line, action, finding and report path is
+    also written to stdout as one JSON object per line, prefixed with '@@ADHK '. The console
+    colouring is left out, and the unattended -Apply confirmation is skipped, because the front
+    end asked for its own confirmation before starting the run.
+
     .PARAMETER NoMenu
     Started without any parameters on an interactive console, the script shows a menu instead of
     running a scan. This switch suppresses the menu for the one case that is otherwise ambiguous:
@@ -195,12 +206,18 @@
     Only the logging group. Useful as a first step: it changes what is recorded, not what is
     allowed, so nothing can stop working.
 
+    .EXAMPLE
+    .\ADHardenKit.ps1 -Mode Catalog
+
+    Prints the baseline as JSON - every setting with its explanation, values and minimum version.
+    Needs no domain and no RSAT. This is what the graphical front end reads.
+
     Exit codes: 0 success, 1 failures, 2 drift found, 3 prerequisites failed,
     4 enforcing would break something that is still in use.
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
-    [ValidateSet('Scan', 'Deploy', 'Audit', 'Check')]
+    [ValidateSet('Scan', 'Deploy', 'Audit', 'Check', 'Catalog')]
     [string]$Mode = 'Scan',
 
     # Not named -Profile: $PROFILE is a PowerShell automatic variable holding the path to the
@@ -239,12 +256,16 @@ param(
 
     [switch]$AllowDowngrade,
 
+    [string[]]$ExcludeTopic,
+
+    [switch]$EventStream,
+
     [switch]$NoMenu
 )
 
 # Bumped whenever the baseline or a mechanism changes. Printed on every run and carried into the
 # report, so "which version produced this" is answerable from a pasted log rather than guessed at.
-$script:HardenKitVersion = '1.4.0'
+$script:HardenKitVersion = '1.5.0'
 
 $ErrorActionPreference = 'Stop'
 
@@ -259,7 +280,7 @@ $script:BackupDirectory = Join-Path $ReportDirectory 'Backups'
 
 # A missing RSAT module is the most common first-run failure, and the raw Import-Module error
 # names neither the fix nor the tool. Said plainly instead, with the command that installs it.
-foreach ($requiredModule in 'ActiveDirectory', 'GroupPolicy') {
+foreach ($requiredModule in $(if ($Mode -eq 'Catalog') { @() } else { 'ActiveDirectory', 'GroupPolicy' })) {
     try { Import-Module $requiredModule -ErrorAction Stop }
     catch {
         Write-Host ''
@@ -269,11 +290,16 @@ foreach ($requiredModule in 'ActiveDirectory', 'GroupPolicy') {
         Write-Host '    Windows 10/11:   Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0' -ForegroundColor Cyan
         Write-Host '                     Add-WindowsCapability -Online -Name Rsat.GroupPolicy.Management.Tools~~~~0.0.1.0' -ForegroundColor Cyan
         Write-Host ''
+        if ($EventStream) {
+            [Console]::Out.WriteLine('@@ADHK ' + (@{ type = 'missingModule'; module = $requiredModule } | ConvertTo-Json -Compress))
+        }
         exit 3
     }
 }
 
 $script:LogFile = $null
+$script:EventStream = [bool]$EventStream
+$script:ExcludedTopics = @($ExcludeTopic | Where-Object { $_ })
 $script:Actions = [System.Collections.Generic.List[object]]::new()
 $script:Context = $null
 # Not $script:Interactive: a script parameter lives in script scope, so that name would be the
@@ -296,6 +322,23 @@ $script:BackupDirectory = $null
 ####################################################################################################
 #region Core
 ####################################################################################################
+
+function Send-HardenEvent {
+    <#
+        .SYNOPSIS
+        One JSON line on stdout for the graphical front end. Does nothing without -EventStream.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Type,
+        [System.Collections.IDictionary]$Data = @{}
+    )
+
+    if (-not $script:EventStream) { return }
+    $payload = [ordered]@{ type = $Type }
+    foreach ($k in $Data.Keys) { $payload[$k] = $Data[$k] }
+    [Console]::Out.WriteLine('@@ADHK ' + ($payload | ConvertTo-Json -Compress -Depth 6))
+}
 
 function Initialize-HardenLog {
     [CmdletBinding()]
@@ -333,7 +376,10 @@ function Write-HardenLog {
         default { 'Gray' }
     }
 
-    if ($Level -eq 'Header') {
+    if ($script:EventStream) {
+        Send-HardenEvent -Type 'log' -Data @{ level = $Level; message = $Message }
+    }
+    elseif ($Level -eq 'Header') {
         Write-Host ''
         Write-Host "=== $Message ===" -ForegroundColor $colour
     }
@@ -367,6 +413,7 @@ function Add-HardenAction {
             Severity  = $Severity
             Detail    = $Detail
         })
+    Send-HardenEvent -Type 'action' -Data @{ area = $Area; setting = $Setting; target = $Target; result = $Result; severity = $Severity; detail = $Detail }
 }
 
 function Initialize-HardenContext {
@@ -1935,6 +1982,10 @@ function Request-HardenTopicDecision {
         [Parameter(Mandatory)][string]$Level
     )
 
+    if ($script:ExcludedTopics -contains $TopicName) {
+        Write-HardenLog -Message "$TopicName : skipping - excluded by -ExcludeTopic" -Level Skip
+        return $false
+    }
     if (-not $script:InteractiveMode) { return $true }
     if ($script:AutoDecision -eq 'All') { return $true }
     if ($script:AutoDecision -eq 'None') { return $false }
@@ -2136,7 +2187,8 @@ function Request-HardenTopicDecision {
 function Test-HardenTopicApproved {
     <#
         .SYNOPSIS
-        Whether the topic an item belongs to was approved. True outside interactive mode.
+        Whether the topic an item belongs to was approved. True outside interactive mode, unless
+        the topic was named in -ExcludeTopic.
     #>
     [CmdletBinding()]
     param(
@@ -2144,11 +2196,12 @@ function Test-HardenTopicApproved {
         [string]$Topic
     )
 
+    $key = if ($Topic) { $Topic } else { $Item.Topic }
+    if ($key -and $script:ExcludedTopics -contains $key) { return $false }
     if (-not $script:InteractiveMode) { return $true }
     if ($script:AutoDecision -eq 'All') { return $true }
     if ($script:AutoDecision -eq 'None') { return $false }
 
-    $key = if ($Topic) { $Topic } else { $Item.Topic }
     if ($key -and $script:DecisionCache.ContainsKey($key)) { return $script:DecisionCache[$key] }
     return $true
 }
@@ -3004,6 +3057,7 @@ function Invoke-HardenScan {
         param([AllowNull()][string]$Group, [string]$Text)
         $blockers.Add($Text)
         $script:ScanFindings.Add([pscustomobject]@{ Group = $Group; Text = $Text })
+        Send-HardenEvent -Type 'finding' -Data @{ group = $Group; text = $Text }
     }
 
     Write-HardenLog -Message "Scan over the last $Days day(s)" -Level Header
@@ -4283,6 +4337,7 @@ $(if ($stepHtml) { '<section class="card"><h2>What to do next</h2>' + $stepHtml 
 
     Set-Content -LiteralPath $htmlPath -Value $html -Encoding UTF8 -WhatIf:$false -Confirm:$false
 
+    Send-HardenEvent -Type 'report' -Data @{ html = $htmlPath; json = $jsonPath; log = $script:LogFile }
     return [pscustomobject]@{ Json = $jsonPath; Html = $htmlPath }
 }
 
@@ -4655,6 +4710,26 @@ function Show-HardenMenu {
 $started = Get-Date
 $exitCode = 0
 
+if ($EventStream) {
+    # A front end reads stdout as UTF-8; the console default on Windows PowerShell is the OEM
+    # code page, which would turn every umlaut in an OU name into a question mark.
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+}
+
+# The catalog is data for a front end: no domain, no log file, no report - just the baseline as
+# JSON on stdout. Handled before anything else so it works on a workstation without RSAT.
+if ($Mode -eq 'Catalog') {
+    $catalog = [ordered]@{
+        version     = $script:HardenKitVersion
+        settings    = @(Get-HardenBaseline | ForEach-Object { [pscustomobject]$_ })
+        auditPolicy = @(Get-HardenAuditPolicy)
+    }
+    $json = $catalog | ConvertTo-Json -Depth 8 -Compress
+    if ($EventStream) { [Console]::Out.WriteLine('@@ADHK {"type":"catalog","data":' + $json + '}') }
+    else { $json }
+    exit 0
+}
+
 # Argument validation before anything else runs. Deploy-only switches in a mode that cannot honour
 # them are almost always a forgotten -Mode Deploy, and carrying on with the scan would be worse
 # than an error: the person reads a successful-looking run and walks away believing something was
@@ -4814,7 +4889,7 @@ switch ($Mode) {
 
         # The brake for the unattended sharp run. Not shown with -Interactive, where every topic is
         # confirmed anyway, nor with -Force, nor on a host with no console.
-        if ($Apply -and -not $Interactive -and -not $Force -and [Environment]::UserInteractive) {
+        if ($Apply -and -not $Interactive -and -not $Force -and -not $EventStream -and [Environment]::UserInteractive) {
             if (-not (Confirm-HardenApply -HardeningProfile $HardeningProfile -Level $Level -Area $Area `
                         -GpoNamePattern $GpoNamePattern -MemberOu $MemberServerOu)) {
                 Write-HardenLog -Message 'Not confirmed - nothing was written.' -Level Info
@@ -4825,7 +4900,7 @@ switch ($Mode) {
         if ($Interactive) {
             # Refuse rather than silently deploy everything: a host with no console cannot answer,
             # and a prompt that times out into yes is worse than no prompt at all.
-            if (-not [Environment]::UserInteractive) {
+            if (-not [Environment]::UserInteractive -or $EventStream) {
                 Write-HardenLog -Message '-Interactive was asked for but this session has no console to ask on. Nothing was done.' -Level Error
                 exit 3
             }
