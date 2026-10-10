@@ -11,6 +11,9 @@
 - `-Mode Catalog`: the baseline as JSON, without a domain or RSAT.
 - `-EventStream`: machine-readable output for a front end.
 - `-ExcludeTopic`: leave named topics out of a Deploy run without `-Interactive`.
+- Logic tests that run the deployment and the scan against mocked domain controllers and a fake
+  SYSVOL: plan mode, never-weaken, link precedence, `-ExcludeTopic`, localised empty logs,
+  drift between domain controllers.
 - CI builds and tests the app; a `v*` tag publishes a release zip with the app and the scripts.
 
 ## 1.4.0
@@ -43,6 +46,11 @@
   `beforeprint` and `afterprint`.
 - Missing RSAT modules end the run with exit code 3 and the install commands, instead of a stack of
   follow-up errors.
+- Security template backups go to `Reports\Backups` instead of a `.bak` next to the template in
+  SYSVOL, where every copy replicated to every domain controller.
+- The rollout in the README told step 7 to deploy LegacyAuth with the Baseline profile to audit
+  outgoing NTLM. All staged LegacyAuth settings are Strict, so that step needs `-Profile Strict`;
+  at level Audit, Strict adds only their observing forms.
 - `Verify-MemberDeployment.ps1` claimed the per-interface NetBIOS setting reaches domain controllers
   only. It reaches both roles through the startup script.
 

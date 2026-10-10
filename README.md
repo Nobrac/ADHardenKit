@@ -318,9 +318,9 @@ Deploying hardening in one shot is how people end up rolling all of it back.
 | 4 | **Signing, observing** | `-Area Signing -Interactive -Apply` | LDAP to negotiate, channel binding to when-supported. Nothing required yet. |
 | 5 | **Protocols** | `-Area Protocols -Apply` | LLMNR, NetBIOS, SMBv1, WinRM. Check for SMBv1 use first. |
 | 6 | **CredentialProtection** | `-Area CredentialProtection -Apply` | Needs a reboot. One server first — check System log events 3033 and 3063. |
-| 7 | **LegacyAuth, observing** | `-Area LegacyAuth -Apply` | Outgoing NTLM to audit. The scan also reports certificate mapping failures (System log events 39, 40, 41). |
+| 7 | **LegacyAuth, observing** | `-Area LegacyAuth -Profile Strict -Apply` | NTLMv2 only, and outgoing NTLM to audit. The staged LegacyAuth settings are all Strict, so without `-Profile Strict` there is nothing to observe; at level Audit, Strict adds only their observing forms. The scan also reports certificate mapping failures (System log events 39, 40, 41). |
 | 8 | **Scan until clean** | `-Mode Scan` | Fix or replace what appears. This is the actual work, and no tool can do it for you. |
-| 9 | **Enforce, one group at a time** | `-Level Enforce -Area Signing -Apply` | Never all at once — when something breaks you want to know which group did it. |
+| 9 | **Enforce, one group at a time** | `-Level Enforce -Area Signing -Apply`, later `-Level Enforce -Area LegacyAuth -Profile Strict -Apply` | Never all at once — when something breaks you want to know which group did it. Keep the profile a group was deployed with: a Baseline run over the LegacyAuth GPO drops the Strict values from it. |
 
 ### Verifying a deployment
 

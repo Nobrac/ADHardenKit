@@ -46,7 +46,10 @@ public sealed partial class ScanViewModel(MainViewModel owner) : RunStepViewMode
         {
             Mode = EngineMode.Scan,
             Areas = journey?.Mode == EngineMode.Scan ? Rollout.DefaultAreas : journey?.Areas ?? Rollout.DefaultAreas,
-            Level = "Enforce",
+            // The current-state comparison targets the values this journey would write: the
+            // observing ones before an Audit deployment, the enforcing ones before Enforce. The
+            // findings themselves do not depend on it.
+            Level = journey?.Level ?? "Audit",
             ScanDays = ScanDays,
         };
         await RunEngineAsync(options, "Scanning - reading event logs and settings on every domain controller...");

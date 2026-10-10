@@ -13,7 +13,7 @@
             <Border Style="{StaticResource Card}" Margin="0,0,6,12">
                 <StackPanel>
                     <TextBlock Text="{Binding PlannedCount}" FontSize="26" FontWeight="SemiBold" Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" />
-                    <TextBlock Style="{StaticResource Muted}" Text="changes planned" />
+                    <TextBlock Style="{StaticResource Muted}" Text="values to write" />
                 </StackPanel>
             </Border>
             <Border Style="{StaticResource Card}" Margin="3,0,3,12">
@@ -35,6 +35,23 @@
                 </StackPanel>
             </Border>
         </UniformGrid>
+
+        <Border Style="{StaticResource Card}" BorderBrush="{StaticResource WarningBrush}"
+                Visibility="{Binding BlockingFindings.Count, Converter={x:Static vm:Converters.PositiveToVisibility}}">
+            <StackPanel>
+                <TextBlock FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,8"
+                           Text="The engine scanned first: these still depend on what this Enforce run would require. Deploying will stop here unless you enforce anyway." />
+                <ItemsControl ItemsSource="{Binding BlockingFindings}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <TextBlock TextWrapping="Wrap" Margin="0,0,0,4">
+                                <Run Text="{Binding Group, Mode=OneWay, StringFormat='[{0}]'}" FontWeight="SemiBold" /> <Run Text="{Binding Text, Mode=OneWay}" />
+                            </TextBlock>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </StackPanel>
+        </Border>
 
         <Border Style="{StaticResource Card}" Padding="4" Visibility="{Binding HasRun, Converter={StaticResource BoolToVisibility}}">
             <DataGrid ItemsSource="{Binding Actions}" AutoGenerateColumns="False" IsReadOnly="True" Height="380"

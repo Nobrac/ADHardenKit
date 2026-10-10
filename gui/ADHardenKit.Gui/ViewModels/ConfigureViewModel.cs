@@ -65,6 +65,7 @@ public sealed partial class ConfigureViewModel : StepViewModel
     [ObservableProperty] private TopicOption? _selectedTopic;
     [ObservableProperty] private string _commandLine = "";
     [ObservableProperty] private string _scopeSummary = "";
+    [ObservableProperty] private string? _profileWarning;
 
     public bool IsBaseline { get => !IsStrict; set => IsStrict = !value; }
     public bool IsAudit { get => !IsEnforce; set => IsEnforce = !value; }
@@ -79,8 +80,13 @@ public sealed partial class ConfigureViewModel : StepViewModel
     public void ApplyJourney(Journey journey)
     {
         _applying = true;
+        // A new journey starts with every topic included again; exclusions from an earlier one
+        // must not carry over unseen.
+        foreach (var t in Topics) t.PropertyChanged -= OnTopicChanged;
+        Topics.Clear();
         foreach (var a in Areas) a.IsSelected = journey.Areas.Contains(a.Name);
         IsEnforce = journey.Level == "Enforce";
+        IsStrict = journey.Profile == "Strict";
         _applying = false;
         Rebuild();
     }
@@ -179,6 +185,22 @@ public sealed partial class ConfigureViewModel : StepViewModel
             foreach (var f in Owner.LastFindings.Where(f => f.Group is not null && selectedAreas.Contains(f.Group)))
             {
                 EnforceWarnings.Add($"[{f.Group}] {f.Text}");
+            }
+        }
+
+        // A group whose staged settings all live in Strict gains nothing staged from a Baseline
+        // run - and the run replaces that group's security template, so Strict values an earlier
+        // run wrote there are dropped.
+        ProfileWarning = null;
+        if (!IsStrict && catalog is not null)
+        {
+            var strictOnly = selectedAreas.Where(area =>
+                catalog.Settings.Any(s => s.Group == area && s.Staged && !s.IsFirewallRule) &&
+                !catalog.Settings.Any(s => s.Group == area && s.Staged && !s.IsFirewallRule && s.Profile == "Baseline")).ToList();
+            if (strictOnly.Count > 0)
+            {
+                ProfileWarning = $"{string.Join(", ", strictOnly)}: the staged settings of this group are all in the Strict profile. " +
+                                 "With Baseline nothing staged is deployed, and Strict values an earlier run wrote into the group's GPO are removed.";
             }
         }
 
