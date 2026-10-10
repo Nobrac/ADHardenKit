@@ -5,3 +5,9 @@ Reports/
 # Windows
 Thumbs.db
 desktop.ini
+
+# .NET build output
+bin/
+obj/
+publish/
+*.user

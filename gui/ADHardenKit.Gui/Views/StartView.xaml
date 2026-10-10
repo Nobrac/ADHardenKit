@@ -1,0 +1,126 @@
+<UserControl x:Class="ADHardenKit.Gui.Views.StartView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="clr-namespace:ADHardenKit.Gui.ViewModels">
+    <StackPanel>
+        <TextBlock Style="{StaticResource PageTitle}" Text="Harden Active Directory, one safe step at a time" TextWrapping="Wrap" />
+        <TextBlock Style="{StaticResource PageSubtitle}">
+            Signing, NTLM, Kerberos, LSA protection and a real audit policy - delivered as small, separate GPOs.
+            Every run reads first, shows you the plan, and writes nothing until you confirm.
+        </TextBlock>
+
+        <!-- Engine status -->
+        <Border Style="{StaticResource Card}" Visibility="{Binding EngineError, Converter={x:Static vm:Converters.NotNullToVisibility}}"
+                BorderBrush="{StaticResource ErrorBrush}">
+            <DockPanel>
+                <Button DockPanel.Dock="Right" Content="Locate ADHardenKit.ps1..." Command="{Binding LocateEngineCommand}" VerticalAlignment="Center" Margin="12,0,0,0" />
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Style="{StaticResource Icon}" Text="&#xEA39;" Foreground="{StaticResource ErrorBrush}" Margin="0,0,10,0" />
+                    <TextBlock Text="{Binding EngineError}" TextWrapping="Wrap" MaxWidth="640" />
+                </StackPanel>
+            </DockPanel>
+        </Border>
+        <StackPanel Orientation="Horizontal" Margin="0,0,0,12" Visibility="{Binding IsBusy, Converter={StaticResource BoolToVisibility}}">
+            <ProgressBar IsIndeterminate="True" Width="120" Height="4" VerticalAlignment="Center" />
+            <TextBlock Text="{Binding LoadingText}" Margin="12,0,0,0" Style="{StaticResource Muted}" />
+        </StackPanel>
+
+        <!-- Three promises: why this is safe to try -->
+        <UniformGrid Columns="3" Margin="0,0,0,8">
+            <Border Style="{StaticResource Card}" Margin="0,0,8,12">
+                <StackPanel>
+                    <TextBlock Style="{StaticResource Icon}" Text="&#xE721;" FontSize="22" Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" HorizontalAlignment="Left" />
+                    <TextBlock Text="Reads before it writes" FontWeight="SemiBold" Margin="0,8,0,4" />
+                    <TextBlock Style="{StaticResource Muted}" Text="The scan names every client that would break - unsigned LDAP binds, NTLM use, RC4-only accounts." />
+                </StackPanel>
+            </Border>
+            <Border Style="{StaticResource Card}" Margin="4,0,4,12">
+                <StackPanel>
+                    <TextBlock Style="{StaticResource Icon}" Text="&#xE8A1;" FontSize="22" Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" HorizontalAlignment="Left" />
+                    <TextBlock Text="Observe, then enforce" FontWeight="SemiBold" Margin="0,8,0,4" />
+                    <TextBlock Style="{StaticResource Muted}" Text="Risky settings deploy in an observing form first. Enforcing scans again and stops if something still depends on them." />
+                </StackPanel>
+            </Border>
+            <Border Style="{StaticResource Card}" Margin="8,0,0,12">
+                <StackPanel>
+                    <TextBlock Style="{StaticResource Icon}" Text="&#xE9F9;" FontSize="22" Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" HorizontalAlignment="Left" />
+                    <TextBlock Text="Small GPOs, full report" FontWeight="SemiBold" Margin="0,8,0,4" />
+                    <TextBlock Style="{StaticResource Muted}" Text="One GPO per purpose and role, so one can be unlinked alone. Every run leaves an HTML report and a log." />
+                </StackPanel>
+            </Border>
+        </UniformGrid>
+
+        <TextBlock Style="{StaticResource SectionTitle}" Text="Recommended rollout" />
+        <TextBlock Style="{StaticResource Muted}" Text="{Binding LastScanText}" Margin="0,0,0,10" />
+
+        <ItemsControl ItemsSource="{Binding Items}">
+            <ItemsControl.ItemTemplate>
+                <DataTemplate DataType="{x:Type vm:RolloutItem}">
+                    <Button x:Name="Btn" Command="{Binding DataContext.ChooseCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                            CommandParameter="{Binding}" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch"
+                            Padding="14,10" Margin="0,0,0,6" Background="Transparent" BorderThickness="1"
+                            BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="40" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <Grid Width="28" Height="28" HorizontalAlignment="Left" VerticalAlignment="Top">
+                                <Ellipse x:Name="Dot" Stroke="{DynamicResource ControlStrongStrokeColorDefaultBrush}" StrokeThickness="1.5" />
+                                <TextBlock x:Name="Num" Text="{Binding Step.Number}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                                <TextBlock x:Name="Tick" Style="{StaticResource Icon}" Text="&#xE73E;" FontSize="13" HorizontalAlignment="Center" Foreground="White" Visibility="Collapsed" />
+                            </Grid>
+                            <StackPanel Grid.Column="1">
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock Text="{Binding Step.Title}" FontWeight="SemiBold" FontSize="14" />
+                                    <Border x:Name="NextBadge" Style="{StaticResource Badge}" Visibility="Collapsed">
+                                        <TextBlock Text="next" FontSize="11" />
+                                    </Border>
+                                </StackPanel>
+                                <TextBlock Text="{Binding Step.Summary}" Style="{StaticResource Muted}" />
+                                <TextBlock x:Name="Why" Text="{Binding Step.Why}" Style="{StaticResource Muted}" FontSize="12" Margin="0,4,0,0" Visibility="Collapsed" />
+                            </StackPanel>
+                            <TextBlock Grid.Column="2" Text="{Binding DoneText}" Style="{StaticResource Muted}" FontSize="12" VerticalAlignment="Top" />
+                        </Grid>
+                    </Button>
+                    <DataTemplate.Triggers>
+                        <DataTrigger Binding="{Binding IsDone}" Value="True">
+                            <Setter TargetName="Dot" Property="Fill" Value="{StaticResource SuccessBrush}" />
+                            <Setter TargetName="Dot" Property="Stroke" Value="{StaticResource SuccessBrush}" />
+                            <Setter TargetName="Num" Property="Visibility" Value="Collapsed" />
+                            <Setter TargetName="Tick" Property="Visibility" Value="Visible" />
+                        </DataTrigger>
+                        <DataTrigger Binding="{Binding IsNext}" Value="True">
+                            <Setter TargetName="NextBadge" Property="Visibility" Value="Visible" />
+                        </DataTrigger>
+                        <DataTrigger Binding="{Binding IsSelected}" Value="True">
+                            <Setter TargetName="Btn" Property="BorderBrush" Value="{DynamicResource AccentFillColorDefaultBrush}" />
+                            <Setter TargetName="Btn" Property="BorderThickness" Value="2" />
+                            <Setter TargetName="Btn" Property="Background" Value="{StaticResource AccentSoftBrush}" />
+                            <Setter TargetName="Why" Property="Visibility" Value="Visible" />
+                        </DataTrigger>
+                    </DataTemplate.Triggers>
+                </DataTemplate>
+            </ItemsControl.ItemTemplate>
+        </ItemsControl>
+
+        <TextBlock Style="{StaticResource SectionTitle}" Text="Or" />
+        <UniformGrid Columns="2">
+            <Button Command="{Binding ChooseScanCommand}" HorizontalContentAlignment="Left" Padding="14,10" Margin="0,0,6,0">
+                <StackPanel>
+                    <TextBlock Text="Just scan" FontWeight="SemiBold" />
+                    <TextBlock Style="{StaticResource Muted}" Text="Read-only. See what would break today." />
+                </StackPanel>
+            </Button>
+            <Button Command="{Binding ChooseCustomCommand}" HorizontalContentAlignment="Left" Padding="14,10" Margin="6,0,0,0">
+                <StackPanel>
+                    <TextBlock Text="Custom deployment" FontWeight="SemiBold" />
+                    <TextBlock Style="{StaticResource Muted}" Text="Pick profile, level, groups and topics yourself." />
+                </StackPanel>
+            </Button>
+        </UniformGrid>
+
+        <TextBlock Style="{StaticResource Muted}" Text="{Binding CatalogSummary}" FontSize="12" Margin="0,16,0,0" />
+    </StackPanel>
+</UserControl>

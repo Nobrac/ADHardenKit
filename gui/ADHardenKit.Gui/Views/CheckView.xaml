@@ -1,0 +1,38 @@
+<UserControl x:Class="ADHardenKit.Gui.Views.CheckView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="clr-namespace:ADHardenKit.Gui.ViewModels">
+    <StackPanel>
+        <TextBlock Style="{StaticResource PageTitle}" Text="Prerequisites" />
+        <TextBlock Style="{StaticResource PageSubtitle}"
+                   Text="The RSAT modules, your rights on Group Policy and SYSVOL, and WinRM to the domain controllers. Read-only." />
+
+        <ContentControl Content="{Binding}" ContentTemplate="{StaticResource RunStatusTemplate}" />
+
+        <!-- RSAT missing: say how to fix it, with commands to copy -->
+        <Border Style="{StaticResource Card}" BorderBrush="{StaticResource WarningBrush}"
+                Visibility="{Binding MissingModule, Converter={x:Static vm:Converters.NotNullToVisibility}}">
+            <StackPanel>
+                <TextBlock FontWeight="SemiBold" TextWrapping="Wrap">
+                    <Run Text="Install the RSAT tools for Active Directory and Group Policy, then check again." />
+                </TextBlock>
+                <TextBlock Style="{StaticResource Muted}" Text="On Windows Server:" Margin="0,10,0,4" />
+                <DockPanel>
+                    <Button DockPanel.Dock="Right" Content="Copy" Margin="8,0,0,0" Command="{Binding CopyCommand}" CommandParameter="{Binding InstallServer}" />
+                    <TextBox Text="{Binding InstallServer, Mode=OneWay}" IsReadOnly="True" FontFamily="Cascadia Mono, Consolas" />
+                </DockPanel>
+                <TextBlock Style="{StaticResource Muted}" Text="On Windows 10 or 11:" Margin="0,10,0,4" />
+                <DockPanel>
+                    <Button DockPanel.Dock="Right" Content="Copy" Margin="8,0,0,0" Command="{Binding CopyCommand}" CommandParameter="{Binding InstallClient}" VerticalAlignment="Top" />
+                    <TextBox Text="{Binding InstallClient, Mode=OneWay}" IsReadOnly="True" FontFamily="Cascadia Mono, Consolas" TextWrapping="Wrap" />
+                </DockPanel>
+            </StackPanel>
+        </Border>
+
+        <Border Style="{StaticResource Card}">
+            <ItemsControl ItemsSource="{Binding Log}" ItemTemplate="{StaticResource LogLineTemplate}" />
+        </Border>
+
+        <Button Content="Check again" HorizontalAlignment="Left" Command="{Binding RunCheckCommand}" />
+    </StackPanel>
+</UserControl>
