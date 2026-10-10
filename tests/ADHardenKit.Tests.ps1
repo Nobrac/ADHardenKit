@@ -134,6 +134,36 @@ Describe 'Get-HardenTemplateValue' {
     }
 }
 
+Describe 'Catalog mode' {
+    It 'prints the whole baseline as JSON without a domain' {
+        $json = & (Join-Path (Split-Path -Parent $PSScriptRoot) 'ADHardenKit.ps1') -Mode Catalog
+        $catalog = ($json -join '') | ConvertFrom-Json
+        @($catalog.settings).Count | Should -Be $script:Baseline.Count
+        @($catalog.auditPolicy).Count | Should -Be $script:Audit.Count
+        $catalog.version | Should -Match '^\d+\.\d+\.\d+$'
+    }
+}
+
+Describe 'Topic exclusion' {
+    BeforeEach {
+        $script:InteractiveMode = $false
+        $script:AutoDecision = $null
+        $script:DecisionCache = @{}
+    }
+
+    It 'approves every topic by default outside interactive mode' {
+        $script:ExcludedTopics = @()
+        Test-HardenTopicApproved -Topic 'LSA protection' | Should -Be $true
+    }
+
+    It 'declines a topic named in -ExcludeTopic' {
+        $script:ExcludedTopics = @('LSA protection')
+        Test-HardenTopicApproved -Topic 'LSA protection' | Should -Be $false
+        Test-HardenTopicApproved -Item @{ Topic = 'LSA protection' } | Should -Be $false
+        Test-HardenTopicApproved -Topic 'SMB audit' | Should -Be $true
+    }
+}
+
 Describe 'Repository hygiene' {
     It 'keeps the README setting count in step with the code' {
         $readme = Get-Content (Join-Path (Split-Path -Parent $PSScriptRoot) 'README.md') -Raw

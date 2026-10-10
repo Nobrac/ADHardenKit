@@ -68,6 +68,30 @@ One PowerShell script. No module, no configuration file, no build step.
 
 ## Quick start
 
+### With the guided app
+
+Download `ADHardenKit-win-x64.zip` from the releases page, unpack it on a domain controller or a
+management host with RSAT, and start `ADHardenKit.exe`. It needs no .NET installation.
+
+The app walks through the recommended rollout and remembers, per domain, which steps are done:
+
+1. **Start** — the rollout with the next step marked, or a plain scan, or a custom deployment.
+2. **Check** — RSAT modules, rights and WinRM. Missing RSAT comes with the install command to copy.
+3. **Scan** — findings grouped by the group they would block, and how many settings are already in place.
+4. **Choose** — profile, level, groups, member server OU (picked from the directory) and each topic,
+   with its explanation, its observing and enforcing value and its current value from the scan.
+   The equivalent command line is shown for a change ticket or a scheduled task.
+5. **Preview** — the engine's plan mode: every change, before anything is written.
+6. **Deploy** — an explicit confirmation; at level Enforce, the domain name has to be typed. If the
+   engine's scan finds something that still depends on the old behaviour, nothing is written and
+   the findings are listed.
+7. **Done** — the HTML report, the log, reboot notes and the next rollout step.
+
+The app is a front end only: every run is `ADHardenKit.ps1` in Windows PowerShell 5.1, with the
+same parameters, the same log and the same report as on the command line.
+
+### From the console
+
 ```powershell
 Unblock-File .\ADHardenKit.ps1
 
@@ -102,6 +126,7 @@ is what step 2 fixes.
 | `.\ADHardenKit.ps1 -Mode Deploy` | ⚠️ | Creates and links the GPOs. **Plans by default** — writes only with `-Apply`. |
 | `.\ADHardenKit.ps1 -Mode Audit` | — | Read-only drift report against the selected profile. |
 | `.\ADHardenKit.ps1 -Mode Check` | — | Prerequisite check only. |
+| `.\ADHardenKit.ps1 -Mode Catalog` | — | The baseline as JSON. Needs no domain and no RSAT. What the app reads. |
 
 | Switch | Effect |
 | --- | --- |
@@ -112,6 +137,8 @@ is what step 2 fixes.
 | `-Area <groups>` | `Signing`, `LegacyAuth`, `CredentialProtection`, `Protocols`, `PolicyIntegrity`, `Logging`, `Services`, `LOLBins`. `LOLBins` is **not** in the default set — ask for it by name. |
 | `-MemberServerOu <dn>` | Where to link the member server GPOs. Without it they are created but left unlinked, and the run says so. The DC GPOs link to `OU=Domain Controllers` automatically. |
 | `-Force` | Proceed even when the scan found evidence that enforcing would break something, and skip the confirmation an unattended `-Apply` otherwise asks for. `-Level Enforce -Apply` runs that scan first, for the selected areas, and stops with exit code `4` without `-Force`. |
+| `-ExcludeTopic <names>` | Leave topics out of a Deploy run, by name (for example `'Credential Guard and VBS'`). The non-interactive equivalent of declining a topic card. |
+| `-EventStream` | One JSON object per line on stdout, prefixed `@@ADHK`, for a front end. Skips the console confirmation, because the front end asks its own. |
 | `-AllowDowngrade` | Write a value even where the existing GPO already holds a stricter one. Without it, a re-run never weakens a setting — for example a `-Level Audit` run over a GPO that was already enforced. |
 
 **Exit codes** &nbsp; `0` success &nbsp;·&nbsp; `1` failures &nbsp;·&nbsp; `2` drift found &nbsp;·&nbsp; `3` prerequisites failed &nbsp;·&nbsp; `4` enforcing would break something still in use
@@ -291,9 +318,9 @@ Deploying hardening in one shot is how people end up rolling all of it back.
 | 4 | **Signing, observing** | `-Area Signing -Interactive -Apply` | LDAP to negotiate, channel binding to when-supported. Nothing required yet. |
 | 5 | **Protocols** | `-Area Protocols -Apply` | LLMNR, NetBIOS, SMBv1, WinRM. Check for SMBv1 use first. |
 | 6 | **CredentialProtection** | `-Area CredentialProtection -Apply` | Needs a reboot. One server first — check System log events 3033 and 3063. |
-| 7 | **LegacyAuth, observing** | `-Area LegacyAuth -Apply` | Outgoing NTLM to audit. The scan also reports certificate mapping failures (System log events 39, 40, 41). |
+| 7 | **LegacyAuth, observing** | `-Area LegacyAuth -Profile Strict -Apply` | NTLMv2 only, and outgoing NTLM to audit. The staged LegacyAuth settings are all Strict, so without `-Profile Strict` there is nothing to observe; at level Audit, Strict adds only their observing forms. The scan also reports certificate mapping failures (System log events 39, 40, 41). |
 | 8 | **Scan until clean** | `-Mode Scan` | Fix or replace what appears. This is the actual work, and no tool can do it for you. |
-| 9 | **Enforce, one group at a time** | `-Level Enforce -Area Signing -Apply` | Never all at once — when something breaks you want to know which group did it. |
+| 9 | **Enforce, one group at a time** | `-Level Enforce -Area Signing -Apply`, later `-Level Enforce -Area LegacyAuth -Profile Strict -Apply` | Never all at once — when something breaks you want to know which group did it. Keep the profile a group was deployed with: a Baseline run over the LegacyAuth GPO drops the Strict values from it. |
 
 ### Verifying a deployment
 
@@ -491,8 +518,9 @@ ADHardenKit.ps1                  the entire tool
 Verify-LoggingDeployment.ps1     post-deployment verification for the Logging group
 Verify-MemberDeployment.ps1      post-deployment verification on a member server
 tests/                           Pester tests (baseline data, parser, static checks)
+gui/                             the guided Windows app (WPF, .NET 10) and its tests
 PSScriptAnalyzerSettings.psd1    analyzer rules used by CI
-.github/workflows/               CI: analyzer and tests on every push
+.github/workflows/               CI: analyzer, Pester, GUI build and tests; release packaging
 README.md · CHANGELOG.md · LICENSE
 Logs/ · Reports/                 created on first run
 ```
