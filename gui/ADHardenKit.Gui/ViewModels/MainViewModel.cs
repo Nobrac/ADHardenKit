@@ -7,7 +7,7 @@ using CommunityToolkit.Mvvm.Input;
 namespace ADHardenKit.Gui.ViewModels;
 
 /// <summary>What the person set out to do: a rollout step, or a run of their own.</summary>
-public sealed record Journey(RolloutStep? Step, EngineMode Mode, IReadOnlyList<string> Areas, string Level)
+public sealed record Journey(RolloutStep? Step, EngineMode Mode, IReadOnlyList<string> Areas, string Level, string Profile = "Baseline")
 {
     public string Title => Step?.Title ?? (Mode == EngineMode.Scan ? "Scan" : "Custom deployment");
     public bool IsDeploy => Mode == EngineMode.Deploy;
@@ -121,13 +121,23 @@ public partial class MainViewModel : ObservableObject
         // until clean" only when the scan really was clean.
         if (Journey?.Step is { } step && Domain is not null && !step.IsWait && (step.Key != "clean" || Scan.IsClean))
         {
-            var key = step.Key == "enforce" ? $"enforce-{string.Join("-", Journey.Areas).ToLowerInvariant()}" : step.Key;
-            State.Completed[key] = DateTimeOffset.Now;
-            if (step.Key == "enforce") State.Completed["enforce"] = DateTimeOffset.Now;
+            if (step.Key == "enforce" || Journey.Level == "Enforce")
+            {
+                // The Enforce step is done group by group; the start page counts it complete once
+                // every group with staged settings has been enforced.
+                foreach (var area in EnforcedAreas()) State.Completed[Rollout.EnforceKey(area)] = DateTimeOffset.Now;
+            }
+            else
+            {
+                State.Completed[step.Key] = DateTimeOffset.Now;
+            }
             RolloutStore.Save(State);
         }
         Start.RefreshRollout();
     }
+
+    /// <summary>The groups the last deployment actually enforced, as the preview recorded them.</summary>
+    IEnumerable<string> EnforcedAreas() => Preview.PreviewedOptions is { Level: "Enforce" } o ? o.Areas : [];
 
     public void RecordScan(int findings, string? report)
     {

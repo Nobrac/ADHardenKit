@@ -10,7 +10,8 @@ public sealed record RolloutStep(
     EngineMode Mode,
     IReadOnlyList<string> Areas,
     string Level = "Audit",
-    bool IsWait = false);
+    bool IsWait = false,
+    string Profile = "Baseline");
 
 public static class Rollout
 {
@@ -47,9 +48,9 @@ public static class Rollout
             "LSA protection and Credential Guard need a reboot. Try one server first and check System log events 3033 and 3063.",
             EngineMode.Deploy, ["CredentialProtection"]),
         new(7, "legacyauth", "Legacy authentication, observing",
-            "Deploy the LegacyAuth group at level Audit.",
-            "Outgoing NTLM is audited, not denied. The scan then shows who still depends on it.",
-            EngineMode.Deploy, ["LegacyAuth"]),
+            "Deploy the LegacyAuth group, profile Strict, at level Audit.",
+            "NTLMv2 only, and outgoing NTLM is audited, not denied. The staged LegacyAuth settings are all in the Strict profile; at level Audit it adds only their observing forms.",
+            EngineMode.Deploy, ["LegacyAuth"], Profile: "Strict"),
         new(8, "clean", "Scan until clean",
             "Scan, fix what it finds, repeat.",
             "This is the actual work: replace or reconfigure every client the scan names. No tool can do it for you.",
@@ -59,6 +60,15 @@ public static class Rollout
             "Never all at once - when something breaks you want to know which group did it. The engine scans first and stops if something still depends on the old behaviour.",
             EngineMode.Deploy, ["Signing"], Level: "Enforce"),
     ];
+
+    /// <summary>
+    /// The groups that carry staged settings, with the profile their staged settings live in -
+    /// the groups the Enforce step walks through, one at a time.
+    /// </summary>
+    public static readonly IReadOnlyList<(string Area, string Profile)> EnforceOrder =
+        [("Signing", "Baseline"), ("LegacyAuth", "Strict")];
+
+    public static string EnforceKey(string area) => "enforce-" + area.ToLowerInvariant();
 
     public static readonly IReadOnlyDictionary<string, string> AreaDescriptions = new Dictionary<string, string>
     {

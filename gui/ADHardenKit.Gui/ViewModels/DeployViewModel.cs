@@ -33,6 +33,8 @@ public sealed partial class DeployViewModel(MainViewModel owner) : RunStepViewMo
           (o.MemberServerOu is null ? ", member GPOs left unlinked." : $", member GPOs linked to {o.MemberServerOu}.")
         : "";
 
+    protected override bool AcceptAction(ActionEvent action) => action.Area != "Scan";
+
     public override bool CanGoNext => base.CanGoNext && Succeeded;
 
     public override string NextLabel => "Finish";

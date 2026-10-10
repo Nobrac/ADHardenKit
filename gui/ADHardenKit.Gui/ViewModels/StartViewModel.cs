@@ -44,13 +44,20 @@ public sealed partial class StartViewModel : StepViewModel
 
     public override async Task OnEnterAsync()
     {
-        RefreshRollout();
-        if (_loaded) return;
-        _loaded = true;
-
-        Owner.Domain = DirectoryBrowser.CurrentDomain();
-        if (Owner.Domain is not null) Owner.State = RolloutStore.Load(Owner.Domain);
-        RefreshRollout();
+        if (!_loaded)
+        {
+            _loaded = true;
+            // The rollout state has to be known before the next step is picked, or a domain that
+            // is halfway through would start at step 1 again.
+            Owner.Domain = DirectoryBrowser.CurrentDomain();
+            if (Owner.Domain is not null) Owner.State = RolloutStore.Load(Owner.Domain);
+            RefreshRollout();
+        }
+        else
+        {
+            RefreshRollout();
+            return;
+        }
 
         var script = EngineLocator.Find();
         if (script is null)
@@ -105,6 +112,12 @@ public sealed partial class StartViewModel : StepViewModel
         foreach (var item in Items)
         {
             var done = state.Completed.TryGetValue(item.Step.Key, out var when);
+            if (item.Step.Key == "enforce")
+            {
+                var keys = Rollout.EnforceOrder.Select(e => Rollout.EnforceKey(e.Area)).ToList();
+                done = keys.All(state.Completed.ContainsKey);
+                when = done ? keys.Max(k => state.Completed[k]) : default;
+            }
             // The waiting step is done once a scan ran at least two weeks after the first one.
             if (item.Step.IsWait && state.Completed.TryGetValue("scan", out var first) && state.LastScan is { } last && last - first >= TimeSpan.FromDays(14))
             {
@@ -131,7 +144,20 @@ public sealed partial class StartViewModel : StepViewModel
     {
         if (item is null) return;
         var step = item.Step;
-        Owner.BeginJourney(new Journey(step, step.Mode, step.Areas, step.Level));
+        var areas = step.Areas;
+        var profile = step.Profile;
+        if (step.Key == "enforce")
+        {
+            // One group at a time: the first group with staged settings not enforced yet, with the
+            // profile its staged settings belong to.
+            var (area, p) = Rollout.EnforceOrder.FirstOrDefault(e => !Owner.State.Completed.ContainsKey(Rollout.EnforceKey(e.Area)));
+            if (area is not null)
+            {
+                areas = [area];
+                profile = p;
+            }
+        }
+        Owner.BeginJourney(new Journey(step, step.Mode, areas, step.Level, profile));
         foreach (var i in Items) i.IsSelected = i == item;
         IsCustomSelected = false;
         IsScanSelected = false;

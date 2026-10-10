@@ -276,6 +276,8 @@ if (-not $scriptRoot -and $MyInvocation.MyCommand.Path) { $scriptRoot = Split-Pa
 if (-not $scriptRoot) { $scriptRoot = (Get-Location).Path }
 if (-not $LogDirectory) { $LogDirectory = Join-Path $scriptRoot 'Logs' }
 if (-not $ReportDirectory) { $ReportDirectory = Join-Path $scriptRoot 'Reports' }
+# Where earlier security templates are kept before being replaced - never inside SYSVOL, where a
+# backup file would replicate to every domain controller.
 $script:BackupDirectory = Join-Path $ReportDirectory 'Backups'
 
 # A missing RSAT module is the most common first-run failure, and the raw Import-Module error
@@ -315,9 +317,6 @@ $script:ScopeAuditPolicy = @()
 $script:LolFirewallGroup = 'ADHardenKit-LOLBins'
 # Findings of the last scan with the group each one gates - read by the Enforce gate in Deploy.
 $script:ScanFindings = [System.Collections.Generic.List[object]]::new()
-# Where earlier security templates are kept before being replaced. Set at the entry point; never
-# inside SYSVOL, where a backup file would replicate to every domain controller.
-$script:BackupDirectory = $null
 
 ####################################################################################################
 #region Core
@@ -3054,10 +3053,13 @@ function Invoke-HardenScan {
     # reason to refuse a deployment.
     $script:ScanFindings = [System.Collections.Generic.List[object]]::new()
     $addFinding = {
-        param([AllowNull()][string]$Group, [string]$Text)
+        # Untyped on purpose: a [string] parameter turns $null into '', and an informational
+        # finding would then carry an empty group instead of none.
+        param($Group, [string]$Text)
+        $g = if ($Group) { [string]$Group } else { $null }
         $blockers.Add($Text)
-        $script:ScanFindings.Add([pscustomobject]@{ Group = $Group; Text = $Text })
-        Send-HardenEvent -Type 'finding' -Data @{ group = $Group; text = $Text }
+        $script:ScanFindings.Add([pscustomobject]@{ Group = $g; Text = $Text })
+        Send-HardenEvent -Type 'finding' -Data @{ group = $g; text = $Text }
     }
 
     Write-HardenLog -Message "Scan over the last $Days day(s)" -Level Header

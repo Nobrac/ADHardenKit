@@ -53,6 +53,11 @@
             </Border>
         </UniformGrid>
 
+        <Border Style="{StaticResource Card}" BorderBrush="{StaticResource WarningBrush}"
+                Visibility="{Binding ProfileWarning, Converter={x:Static vm:Converters.NotNullToVisibility}}">
+            <TextBlock Text="{Binding ProfileWarning}" TextWrapping="Wrap" />
+        </Border>
+
         <!-- What the last scan says about enforcing these groups -->
         <Border Style="{StaticResource Card}" BorderBrush="{StaticResource WarningBrush}"
                 Visibility="{Binding EnforceWarnings.Count, Converter={x:Static vm:Converters.PositiveToVisibility}}">

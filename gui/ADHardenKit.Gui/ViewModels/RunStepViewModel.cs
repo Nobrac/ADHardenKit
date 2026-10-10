@@ -91,7 +91,7 @@ public abstract partial class RunStepViewModel(MainViewModel owner, string title
                 Log.Add(new LogLine(l.Level, l.Message));
                 if (l.Level == "Header") StatusText = l.Message;
                 break;
-            case ActionEvent a:
+            case ActionEvent a when AcceptAction(a):
                 Actions.Add(a);
                 break;
             case FindingEvent f:
@@ -109,6 +109,12 @@ public abstract partial class RunStepViewModel(MainViewModel owner, string title
                 break;
         }
     }
+
+    /// <summary>
+    /// Whether an action belongs on this page. A Deploy at level Enforce runs a scan first, and
+    /// those rows describe the domain, not the deployment.
+    /// </summary>
+    protected virtual bool AcceptAction(ActionEvent action) => true;
 
     [RelayCommand(CanExecute = nameof(CanCancel))]
     private void Cancel() => _cts?.Cancel();

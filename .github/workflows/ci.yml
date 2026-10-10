@@ -25,7 +25,7 @@ jobs:
         shell: pwsh
         run: |
           $results = @(Get-ChildItem -Filter *.ps1 -Recurse |
-              Where-Object FullName -notmatch '[\\/]gui[\\/]' |
+              Where-Object FullName -notmatch '[\\/](gui|harness)[\\/]' |
               ForEach-Object { Invoke-ScriptAnalyzer -Path $_.FullName -Settings ./PSScriptAnalyzerSettings.psd1 })
           $results | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize -Wrap
           if ($results.Count) { throw "$($results.Count) analyzer finding(s)" }

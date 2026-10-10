@@ -13,6 +13,11 @@ public sealed partial class PreviewViewModel(MainViewModel owner) : RunStepViewM
     [ObservableProperty] private int _warningCount;
     [ObservableProperty] private RunOptions? _previewedOptions;
 
+    /// <summary>At level Enforce: what the engine's own scan says this run would break.</summary>
+    public System.Collections.ObjectModel.ObservableCollection<FindingEvent> BlockingFindings { get; } = [];
+
+    protected override bool AcceptAction(ActionEvent action) => action.Area != "Scan";
+
     public override bool CanGoNext => base.CanGoNext && Succeeded && PlannedCount > 0;
 
     public override string NextLabel => "Continue to deploy";
@@ -32,6 +37,8 @@ public sealed partial class PreviewViewModel(MainViewModel owner) : RunStepViewM
         var options = Owner.BuildOptions(EngineMode.Deploy);
         await RunEngineAsync(options, "Planning - comparing every setting with what the GPOs hold today...");
         PreviewedOptions = options;
+        BlockingFindings.Clear();
+        foreach (var f in Findings.Where(f => f.Group is not null && options.Areas.Contains(f.Group))) BlockingFindings.Add(f);
         PlannedCount = Actions.Count(a => a.Result == "Planned");
         CompliantCount = Actions.Count(a => a.Result == "Compliant");
         SkippedCount = Actions.Count(a => a.Result == "Skipped");
