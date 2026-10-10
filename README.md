@@ -9,7 +9,7 @@
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE?style=for-the-badge&logo=powershell&logoColor=white)](#prerequisites)
 [![Platform](https://img.shields.io/badge/Windows_Server-2016%2B-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#prerequisites)
 ![Lab tested](https://img.shields.io/badge/lab_tested-Server_2025-2ea44f?style=for-the-badge)
-[![Settings](https://img.shields.io/badge/93_settings-38_topics-6f42c1?style=for-the-badge)](#what-it-deploys)
+[![Settings](https://img.shields.io/badge/92_settings-38_topics-6f42c1?style=for-the-badge)](#what-it-deploys)
 [![License](https://img.shields.io/badge/license-GPLv3-555555?style=for-the-badge)](LICENSE)
 
 <br>
@@ -17,7 +17,7 @@
 [**Quick start**](#quick-start) &nbsp;·&nbsp;
 [**Modes**](#modes) &nbsp;·&nbsp;
 [**What it deploys**](#what-it-deploys) &nbsp;·&nbsp;
-[**Staged settings**](#the-nine-staged-settings) &nbsp;·&nbsp;
+[**Staged settings**](#the-eight-staged-settings) &nbsp;·&nbsp;
 [**Rollout**](#the-rollout) &nbsp;·&nbsp;
 [**Troubleshooting**](#troubleshooting)
 
@@ -43,7 +43,7 @@ So checklists get half-applied, or applied on a Friday and rolled back on a Mond
 
 **ADHardenKit is built around the order of operations, not the list.** It turns on the observation
 first, reads what the domain is actually doing, tells you by name which clients would break, and
-only then offers to enforce. Nine settings carry that risk and each has two forms — one that
+only then offers to enforce. Eight settings carry that risk and each has two forms — one that
 watches, one that requires.
 
 One PowerShell script. No module, no configuration file, no build step.
@@ -55,7 +55,7 @@ One PowerShell script. No module, no configuration file, no build step.
 > the first enforced deployment.
 
 > [!CAUTION]
-> **Unlinking is not a full revert.** Only the 22 settings delivered as policy registry values
+> **Unlinking is not a full revert.** Only the 34 settings delivered as policy registry values
 > disappear when the link goes. The 39 in the security template and the 18 written outside a
 > `Policies` branch stay where they are — see [rolling back](#rolling-back) for what to write back.
 
@@ -111,7 +111,8 @@ is what step 2 fixes.
 | `-Level Audit\|Enforce` | `Audit` deploys staged settings in their observing form. `Enforce` requires them. |
 | `-Area <groups>` | `Signing`, `LegacyAuth`, `CredentialProtection`, `Protocols`, `PolicyIntegrity`, `Logging`, `Services`, `LOLBins`. `LOLBins` is **not** in the default set — ask for it by name. |
 | `-MemberServerOu <dn>` | Where to link the member server GPOs. Without it they are created but left unlinked, and the run says so. The DC GPOs link to `OU=Domain Controllers` automatically. |
-| `-Force` | Proceed even when the scan found evidence that enforcing would break something, and skip the confirmation an unattended `-Apply` otherwise asks for. |
+| `-Force` | Proceed even when the scan found evidence that enforcing would break something, and skip the confirmation an unattended `-Apply` otherwise asks for. `-Level Enforce -Apply` runs that scan first, for the selected areas, and stops with exit code `4` without `-Force`. |
+| `-AllowDowngrade` | Write a value even where the existing GPO already holds a stricter one. Without it, a re-run never weakens a setting — for example a `-Level Audit` run over a GPO that was already enforced. |
 
 **Exit codes** &nbsp; `0` success &nbsp;·&nbsp; `1` failures &nbsp;·&nbsp; `2` drift found &nbsp;·&nbsp; `3` prerequisites failed &nbsp;·&nbsp; `4` enforcing would break something still in use
 
@@ -119,14 +120,14 @@ is what step 2 fixes.
 
 ## What it deploys
 
-**93 settings in 38 topics, plus 28 advanced audit subcategories and 50 LOLBin firewall rules in 6
+**92 settings in 38 topics, plus 28 advanced audit subcategories and 50 LOLBin firewall rules in 6
 topics.** Every group becomes its own GPO per role — sixteen small ones rather than two large ones. Names follow `-GpoNamePattern`, so they
 can match your own convention.
 
 | Group | Domain controllers | Member servers | Settings |
 | --- | --- | --- | :-: |
 | **Signing** | `ADHardenKit-DC-Signing` | `ADHardenKit-Member-Signing` | 14 / 12 |
-| **LegacyAuth** | `ADHardenKit-DC-LegacyAuth` | `ADHardenKit-Member-LegacyAuth` | 14 / 11 |
+| **LegacyAuth** | `ADHardenKit-DC-LegacyAuth` | `ADHardenKit-Member-LegacyAuth` | 13 / 11 |
 | **CredentialProtection** | `ADHardenKit-DC-CredentialProtection` | `ADHardenKit-Member-CredentialProtection` | 19 / 21 |
 | **Protocols** | `ADHardenKit-DC-Protocols` | `ADHardenKit-Member-Protocols` | 24 / 26 |
 | **PolicyIntegrity** | `ADHardenKit-DC-PolicyIntegrity` | `ADHardenKit-Member-PolicyIntegrity` | 3 / 3 |
@@ -137,8 +138,8 @@ can match your own convention.
 | Group | What it covers |
 | --- | --- |
 | **Signing** | LDAP server signing, channel binding, client integrity · SMB signing offered and required, **with the audit policy that finds what would break first** · Netlogon secure channel |
-| **LegacyAuth** | NTLMv2 only, no LM hash · NTLM session security · NTLM restriction both directions · Kerberos AES only · **Kerberos armoring (FAST), the prerequisite for Authentication Policies** · strong certificate binding for Kerberos **and** Schannel · no plaintext or guest SMB |
-| **CredentialProtection** | LSA protection · Credential Guard with VBS and HVCI · **RDP with NLA, TLS and no outbound credential delegation** · WDigest, stored and cached credentials · four anonymous restrictions · machine account rotation · `LocalAccountTokenFilterPolicy` |
+| **LegacyAuth** | NTLMv2 only, no LM hash · NTLM session security · NTLM restriction both directions · Kerberos AES only · **Kerberos armoring (FAST), the prerequisite for Authentication Policies** · strong certificate mapping for Schannel (the KDC side has been enforced by Windows itself since 2025) · no plaintext or guest SMB |
+| **CredentialProtection** | LSA protection · Credential Guard with VBS (HVCI in Strict) · **RDP with NLA, TLS and no outbound credential delegation** · WDigest, stored and cached credentials · four anonymous restrictions · machine account rotation · `LocalAccountTokenFilterPolicy` |
 | **Protocols** | **TLS 1.0/1.1, RC4 and Triple DES off in Schannel** · LLMNR, NetBIOS **and mDNS** off, NetBIOS also per interface via a GPO startup script · SMBv1 driver **and** the Workstation dependency that goes with it · WinRM without basic, digest or plaintext · **SMB 3.0 minimum dialect, authentication rate limiter, no remote mailslots** · **Point and Print restricted to administrators** |
 | **PolicyIntegrity** | UNC hardened paths for SYSVOL and NETLOGON with SMB encryption (MS15-011) · forced reapplication of the security policy · no Group Policy caching, so a reboot applies the current policy and not the cached one |
 | **Logging** | 28 audit subcategories · PowerShell logging · command line in event 4688 · NTLM auditing · LDAP interface diagnostics · log sizes · `SCENoApplyLegacyAuditPolicy` |
@@ -173,15 +174,13 @@ surfaced: every affected setting carries its minimum version, the interactive ca
 
 | Minimum | Settings | What they are |
 |---|:-:|---|
-| Server 2008 R2 | 1 | SMB signing audit, server side |
 | Server 2012 | 2 | Kerberos armoring, KDC and client |
-| Server 2016 | 2 | Credential Guard, HVCI — also need virtualisation and Secure Boot |
+| Server 2016 | 3 | Credential Guard, HVCI — also need virtualisation and Secure Boot; SMB server signing audit — also needs the September 2025 cumulative update |
 | Server 2019 | 1 | mDNS off |
-| Server 2022 | 2 | SMB 3.0 minimum dialect |
-| Server 2025 | 6 | SMB encryption and guest audit, authentication rate limiter, remote mailslots, NetBIOS policy |
+| Server 2025 | 8 | SMB encryption and guest audit, client signing audit, authentication rate limiter, remote mailslots, NetBIOS policy, SMB 3.0 minimum dialect |
 | no constraint | 78 | everything else |
 
-In practice: on **Server 2022**, 6 of 92 settings do nothing. On **Server 2019**, 8. Nothing breaks
+In practice: on **Server 2022** and **Server 2019**, 8 of 92 settings do nothing. On **Server 2016**, 9. Nothing breaks
 either way, and the remainder — signing, NTLM, Kerberos, LSA protection, auditing — is the part
 that matters most and works everywhere.
 
@@ -195,7 +194,7 @@ settings. No schema extension is needed for anything in this tool.
 
 ---
 
-## The nine staged settings
+## The eight staged settings
 
 These are the ones that can break something.
 
@@ -207,9 +206,8 @@ These are the ones that can break something.
 | SMB server requires signing | *not deployed* | `1` require | SMBServer/Audit log. Old NAS devices and appliances |
 | SMB client requires signing | *not deployed* | `1` require | SMBClient/Connectivity log. Backup jobs pointed at old appliances |
 | Deny outgoing NTLM | `1` audit | `2` deny | NTLM operational log, **event 8001** |
-| Deny incoming NTLM | *not deployed* | `2` deny | NTLM operational log, **event 8004** |
+| Deny incoming NTLM | *not deployed* | `2` deny | NTLM operational log, **event 8002** on the receiving machine |
 | Kerberos encryption types | `0x7FFFFFFC` | `0x7FFFFFF8` | Accounts whose `msDS-SupportedEncryptionTypes` still allows RC4 |
-| Strong certificate binding | `1` compatibility | `2` enforce | System log, **events 39, 40, 41** |
 
 **Three say *not deployed* rather than a value**, and that is the interesting part. SMB signing has
 no observation form in its registry key — it is either required or it is not. A zero there would
@@ -293,7 +291,7 @@ Deploying hardening in one shot is how people end up rolling all of it back.
 | 4 | **Signing, observing** | `-Area Signing -Interactive -Apply` | LDAP to negotiate, channel binding to when-supported. Nothing required yet. |
 | 5 | **Protocols** | `-Area Protocols -Apply` | LLMNR, NetBIOS, SMBv1, WinRM. Check for SMBv1 use first. |
 | 6 | **CredentialProtection** | `-Area CredentialProtection -Apply` | Needs a reboot. One server first — check System log events 3033 and 3063. |
-| 7 | **LegacyAuth, observing** | `-Area LegacyAuth -Apply` | Outgoing NTLM to audit, certificate binding to compatibility. |
+| 7 | **LegacyAuth, observing** | `-Area LegacyAuth -Apply` | Outgoing NTLM to audit. The scan also reports certificate mapping failures (System log events 39, 40, 41). |
 | 8 | **Scan until clean** | `-Mode Scan` | Fix or replace what appears. This is the actual work, and no tool can do it for you. |
 | 9 | **Enforce, one group at a time** | `-Level Enforce -Area Signing -Apply` | Never all at once — when something breaks you want to know which group did it. |
 
@@ -347,6 +345,10 @@ log, not a clean domain — and it is reported as a finding, not a pass. It also
 *absent* from *wrong*: settings whose platform default already matches the target are reported as
 compliant, not as gaps.
 
+**A re-run never weakens a setting.** Before writing a security option the tool reads what the
+GPO already holds, and keeps the stricter value. That is what makes `-Level Audit` safe to run
+again after a group was enforced. `-AllowDowngrade` is the explicit way back.
+
 **Deployment is additive, and so is most of it on the way out.** The tool sets values and never
 removes what was there before. Unlinking stops further enforcement, but only policy registry values
 are withdrawn — the security template's values and everything outside a `Policies` branch stay.
@@ -386,6 +388,21 @@ cannot be restarted on its own. The value is in the registry; it takes effect at
 **The scan calls the LDAP result meaningless.** The LDAP interface diagnostic is off, so event 2889
 is not being written. Deploy the Logging group; it enforces nothing.
 
+**The run stops with exit code 3 and lists install commands.** The `ActiveDirectory` or
+`GroupPolicy` module is missing. On a server: `Install-WindowsFeature RSAT-AD-PowerShell, GPMC`.
+On Windows 11: `Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0`
+and `Rsat.GroupPolicy.Management.Tools~~~~0.0.1.0`.
+
+**`-Level Enforce -Apply` stops with exit code 4.** The scan found something that still uses what
+the enforcing value would refuse. The report lists it; fix that first, or pass `-Force` if you have
+checked it is harmless. A diagnostic that is switched off (for example the LDAP interface events)
+also counts, because the scan cannot vouch for a log it cannot read.
+
+**The run warns that another GPO "outranks" this one.** A GPO linked higher on the same OU — often
+the Default Domain Controllers Policy — sets the same security option and would win. The tool links
+its own GPO at position 1 in that case and reports the conflict; remove the value from the other GPO
+when you get the chance, so the outcome does not depend on link order.
+
 **The member GPOs exist but are not linked.** No `-MemberServerOu` was supplied. They sit fully
 configured under **Group Policy Objects** in the GPMC, just without a link. Re-run with the
 parameter — the link step is idempotent.
@@ -403,9 +420,9 @@ and the result is less convenient than "unlink and you're done":
 
 | Delivered as | On unlink | Count |
 | --- | --- | :-: |
-| `registry.pol` under a `\Policies\` branch | **removed at the next refresh** | 22 |
+| `registry.pol` under a `\Policies\` branch | **removed at the next refresh** | 34 |
 | `registry.pol` outside those branches | stays | 18 |
-| Security template (`GptTmpl.inf`) | **stays** | 40 |
+| Security template (`GptTmpl.inf`) | **stays** | 39 |
 | Startup script | script stops running, value stays | 1 |
 | Firewall rules in the GPO | **removed at the next refresh** | 93 |
 
@@ -445,8 +462,11 @@ Get-ChildItem 'HKLM:\System\CurrentControlSet\Services\NetBT\Parameters\Interfac
     ForEach-Object { Set-ItemProperty $_.PSPath -Name NetbiosOptions -Value 0 }
 ```
 
-Schannel and NetBIOS changes need a **reboot** to take effect in both directions, and LSA
-protection has no undo other than removing the value and restarting. Test it on one server before
+Schannel and NetBIOS changes need a **reboot** to take effect in both directions. LSA protection
+is the hard one: `RunAsPPL = 1` also stores a UEFI variable on machines with Secure Boot, so removing
+the registry value is not enough. Undoing it needs Microsoft's LSA protection opt-out tool and a
+confirmation at the console during boot. `RunAsPPL = 2` (no UEFI lock) avoids this and is the
+value to prefer where an undo must stay possible. Test it on one server before
 the estate.
 
 ---
@@ -455,7 +475,8 @@ the estate.
 
 - **Additive only.** The tool sets values and never removes what was there before. Unlinking stops enforcement without reverting most of it — see [rolling back](#rolling-back).
 - **Single domain per run.** For a forest, run once per domain.
-- **The scan reads one domain controller** for the current-state section. Settings differing between controllers in a multi-site domain will not be caught.
+- **The current-state section reads every domain controller** in one remote call each, and reports a value that differs between controllers as drift. A controller that cannot be reached is listed, not silently skipped.
+- **Member server event logs are not read.** The NTLM, SMB and LDAP findings come from the domain controllers. For the member side, forward the relevant channels (NTLM/Operational, SMBServer/Audit, SMBClient/Audit) with Windows Event Forwarding, or read them per server.
 - **Member servers are only reached through Group Policy.** The tool never connects to them, which is also why the LOLBin scan can only report what ran on the domain controllers.
 - **`LOLBins` needs the NetSecurity module** on the host running the tool (RSAT). Every other group deploys without it, and a missing module fails that group alone rather than the run.
 - **`-NoEventLog` did nothing up to 1.2.0.** It was accepted, documented and never read. From 1.3.0 it skips the unsigned-LDAP-bind and NTLM sections, which are the only two that touch an event log.
@@ -468,7 +489,11 @@ the estate.
 ```
 ADHardenKit.ps1                  the entire tool
 Verify-LoggingDeployment.ps1     post-deployment verification for the Logging group
-README.md · LICENSE
+Verify-MemberDeployment.ps1      post-deployment verification on a member server
+tests/                           Pester tests (baseline data, parser, static checks)
+PSScriptAnalyzerSettings.psd1    analyzer rules used by CI
+.github/workflows/               CI: analyzer and tests on every push
+README.md · CHANGELOG.md · LICENSE
 Logs/ · Reports/                 created on first run
 ```
 
